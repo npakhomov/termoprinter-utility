@@ -2003,7 +2003,15 @@ public partial class Form1 : Form
         private const string DllPath = "ESC_SDK.dll";
         private const int LangId = 0;
         private const string UsbPort = "USB";
+        private const string ResourcePrefix = "HPRT.";
         private const CharSet SdkCharSet = CharSet.Unicode;
+        private static readonly object NativeLock = new();
+        private static string? _nativeDirectory;
+
+        static HprtSdk()
+        {
+            NativeLibrary.SetDllImportResolver(typeof(HprtSdk).Assembly, ResolveNativeLibrary);
+        }
 
         [DllImport(DllPath, CharSet = SdkCharSet)]
         private static extern int FormatError(int errorNo, int langId, byte[] buffer, int pos, int bufferSize);
@@ -2155,6 +2163,63 @@ public partial class Form1 : Form
                 return;
 
             throw new InvalidOperationException("HPRT ESC_SDK.dll 32-битная. Запусти x86-версию программы из папки publish\\single-x86.");
+        }
+
+        private static IntPtr ResolveNativeLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+        {
+            if (!libraryName.Equals(DllPath, StringComparison.OrdinalIgnoreCase))
+                return IntPtr.Zero;
+
+            var nativeDirectory = EnsureNativeLibrariesExtracted();
+            var sdkPath = Path.Combine(nativeDirectory, DllPath);
+            return NativeLibrary.Load(sdkPath);
+        }
+
+        private static string EnsureNativeLibrariesExtracted()
+        {
+            lock (NativeLock)
+            {
+                if (!string.IsNullOrWhiteSpace(_nativeDirectory) && File.Exists(Path.Combine(_nativeDirectory, DllPath)))
+                    return _nativeDirectory;
+
+                var version = Assembly.GetExecutingAssembly()
+                    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                    .InformationalVersion ?? "dev";
+                var safeVersion = string.Concat(version.Select(ch => char.IsLetterOrDigit(ch) || ch is '.' or '-' ? ch : '_'));
+                var targetDirectory = Path.Combine(Path.GetTempPath(), "ThermoPrinterTool", "native", "hprt", safeVersion);
+                Directory.CreateDirectory(targetDirectory);
+
+                var assembly = typeof(HprtSdk).Assembly;
+                var resources = assembly.GetManifestResourceNames()
+                    .Where(name => name.StartsWith(ResourcePrefix, StringComparison.OrdinalIgnoreCase) &&
+                        name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (resources.Count == 0)
+                    throw new FileNotFoundException("HPRT DLL не найдены внутри сборки.");
+
+                foreach (var resourceName in resources)
+                {
+                    var fileName = resourceName[ResourcePrefix.Length..];
+                    var targetPath = Path.Combine(targetDirectory, fileName);
+                    using var resource = assembly.GetManifestResourceStream(resourceName);
+                    if (resource is null)
+                        continue;
+
+                    if (File.Exists(targetPath) && new FileInfo(targetPath).Length == resource.Length)
+                        continue;
+
+                    using var output = File.Create(targetPath);
+                    resource.CopyTo(output);
+                }
+
+                var sdkPath = Path.Combine(targetDirectory, DllPath);
+                if (!File.Exists(sdkPath))
+                    throw new FileNotFoundException("ESC_SDK.dll не найден среди распакованных HPRT DLL.", sdkPath);
+
+                _nativeDirectory = targetDirectory;
+                return targetDirectory;
+            }
         }
 
         private static void ThrowIfFailed(int result, string action)

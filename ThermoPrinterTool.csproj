@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <NativeLibrary Include="Native\HPRT\*.dll" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <EmbeddedResource Include="Native\HPRT\*.dll" LogicalName="HPRT.%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>
