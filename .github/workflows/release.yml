@@ -38,9 +38,11 @@ jobs:
 
           $semver = $version.TrimStart('v')
           $fileVersion = ($semver -replace '-.*$', '') + ".0"
+          $isPrerelease = $semver.Contains("-").ToString().ToLowerInvariant()
           "tag=$version" >> $env:GITHUB_OUTPUT
           "semver=$semver" >> $env:GITHUB_OUTPUT
           "fileversion=$fileVersion" >> $env:GITHUB_OUTPUT
+          "prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -76,6 +78,10 @@ jobs:
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
           $title = "ThermoPrinterTool $tag"
+          $prereleaseArgs = @()
+          if ("${{ steps.version.outputs.prerelease }}" -eq "true") {
+            $prereleaseArgs += "--prerelease"
+          }
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
@@ -83,7 +89,8 @@ jobs:
               .\release-artifacts\ThermoPrinterTool.exe `
               .\release-artifacts\ThermoPrinterTool.zip `
               --title $title `
-              --notes "Automatic ThermoPrinterTool build $tag"
+              --notes "Automatic ThermoPrinterTool build $tag" `
+              @prereleaseArgs
           } else {
             gh release upload $tag `
               .\release-artifacts\ThermoPrinterTool.exe `
