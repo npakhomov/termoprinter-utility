@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v0.1.0-beta"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and publish Windows x86 release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          }
+
+          if ($version -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Version must look like v0.1.0 or v0.1.0-beta"
+          }
+
+          $semver = $version.TrimStart('v')
+          $fileVersion = ($semver -replace '-.*$', '') + ".0"
+          "tag=$version" >> $env:GITHUB_OUTPUT
+          "semver=$semver" >> $env:GITHUB_OUTPUT
+          "fileversion=$fileVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Publish single-file exe
+        shell: pwsh
+        run: |
+          dotnet publish .\ThermoPrinterTool.csproj `
+            -c Release `
+            -r win-x86 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:Version=${{ steps.version.outputs.semver }} `
+            -p:AssemblyVersion=${{ steps.version.outputs.fileversion }} `
+            -p:FileVersion=${{ steps.version.outputs.fileversion }} `
+            -p:InformationalVersion=${{ steps.version.outputs.semver }} `
+            -o .\publish\release
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .\release-artifacts | Out-Null
+          Copy-Item .\publish\release\ThermoPrinterTool.exe .\release-artifacts\ThermoPrinterTool.exe -Force
+          Compress-Archive -Path .\release-artifacts\ThermoPrinterTool.exe -DestinationPath .\release-artifacts\ThermoPrinterTool.zip -Force
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $title = "ThermoPrinterTool $tag"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              .\release-artifacts\ThermoPrinterTool.exe `
+              .\release-artifacts\ThermoPrinterTool.zip `
+              --title $title `
+              --notes "Automatic ThermoPrinterTool build $tag"
+          } else {
+            gh release upload $tag `
+              .\release-artifacts\ThermoPrinterTool.exe `
+              .\release-artifacts\ThermoPrinterTool.zip `
+              --clobber
+          }
