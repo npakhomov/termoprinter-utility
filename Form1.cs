@@ -2038,7 +2038,6 @@ public partial class Form1 : Form
         public static string SetEthernet(string model, bool dhcpEnabled, string ip, string mask, string gateway, string? networkIp)
         {
             EnsureX86();
-            EnsureSdkExists();
             var mode = dhcpEnabled ? 1 : 0;
             return WithOpenAutoPrinter(model, networkIp, printer =>
             {
@@ -2050,7 +2049,6 @@ public partial class Form1 : Form
         public static HprtEthernetResult TryReadEthernet(string model, string? networkIp)
         {
             EnsureX86();
-            EnsureSdkExists();
 
             var mode = 0;
             var ip = new StringBuilder(64);
@@ -2077,14 +2075,12 @@ public partial class Form1 : Form
         public static string CheckAutoReady(string model, string? networkIp)
         {
             EnsureX86();
-            EnsureSdkExists();
             return WithOpenAutoPrinter(model, networkIp, _ => { });
         }
 
         public static string SendCommands(string model, IEnumerable<string> commands, string? networkIp)
         {
             EnsureX86();
-            EnsureSdkExists();
             return WithOpenAutoPrinter(model, networkIp, printer =>
             {
                 foreach (var command in commands)
@@ -2159,21 +2155,6 @@ public partial class Form1 : Form
                 return;
 
             throw new InvalidOperationException("HPRT ESC_SDK.dll 32-битная. Запусти x86-версию программы из папки publish\\single-x86.");
-        }
-
-        private static void EnsureSdkExists()
-        {
-            var localPath = Path.Combine(AppContext.BaseDirectory, DllPath);
-            if (File.Exists(localPath))
-                return;
-
-            if (NativeLibrary.TryLoad(DllPath, typeof(HprtSdk).Assembly, DllImportSearchPath.AssemblyDirectory, out var handle))
-            {
-                NativeLibrary.Free(handle);
-                return;
-            }
-
-            throw new FileNotFoundException("HPRT SDK не найден рядом с программой или внутри сборки.", DllPath);
         }
 
         private static void ThrowIfFailed(int result, string action)
