@@ -8,6 +8,8 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json.Serialization;
 
@@ -18,6 +20,11 @@ public partial class Form1 : Form
     private const string GitHubOwner = "npakhomov";
     private const string GitHubRepository = "termoprinter-utility";
     private const string ReleaseAssetName = "ThermoPrinterTool.exe";
+    private const string Dd340UtilityGoogleDriveFileId = "13WUMg8DRlzyFaIg8dcE8pL-VFxigdjS7";
+    private const string Dd340UtilityFileName = "Utility_ATOL DD340.zip";
+
+    [DllImport("iphlpapi.dll", ExactSpelling = true)]
+    private static extern int SendARP(uint destinationIp, uint sourceIp, byte[] macAddress, ref int physicalAddressLength);
 
     private readonly ComboBox _modelBox = new();
     private readonly ComboBox _printerRoleBox = new();
@@ -145,8 +152,6 @@ public partial class Form1 : Form
         });
 
         left.Controls.Add(CreateSettingsPanel());
-        left.Controls.Add(CreateEthernetPanel());
-        left.Controls.Add(CreatePrinterSettingsPanel());
         left.Controls.Add(CreateStep1Panel());
         left.Controls.Add(CreateStep2Panel());
         left.Controls.Add(CreateStep3Panel());
@@ -353,19 +358,50 @@ public partial class Form1 : Form
 
     private Control CreateStep2Panel()
     {
-        var panel = CreateStepPanel("2. Найти и назначить IP", _freeIpStatusLabel);
+        var panel = CreateStepPanel("2. Свободный IP и утилита", _freeIpStatusLabel);
+        var layout = panel.Controls.OfType<TableLayoutPanel>().First();
         var buttons = GetButtonHost(panel);
+        layout.Controls.Remove(buttons);
+
+        var networkValues = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 3,
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 6)
+        };
+        networkValues.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+        networkValues.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        ConfigureNetworkResultBox(_ethernetIpBox);
+        ConfigureNetworkResultBox(_ethernetMaskBox);
+        ConfigureNetworkResultBox(_ethernetGatewayBox);
+        AddRow(networkValues, 0, "Свободный IP", _ethernetIpBox);
+        AddRow(networkValues, 1, "Маска", _ethernetMaskBox);
+        AddRow(networkValues, 2, "Шлюз", _ethernetGatewayBox);
+        layout.Controls.Add(networkValues);
+        layout.Controls.Add(buttons);
+
         buttons.Controls.Add(CreateButton("Найти свободный IP", FindFreeIp));
+        buttons.Controls.Add(CreateButton("Скачать или запустить утилиту", DownloadOrRunUtility));
         return panel;
+    }
+
+    private static void ConfigureNetworkResultBox(TextBox box)
+    {
+        box.ReadOnly = true;
+        box.BackColor = Color.FromArgb(248, 250, 252);
+        box.ForeColor = Color.FromArgb(35, 45, 60);
+        box.BorderStyle = BorderStyle.FixedSingle;
     }
 
     private Control CreateStep3Panel()
     {
-        var panel = CreateStepPanel("3. Ping и установка драйвера", _networkStatusLabel);
+        var panel = CreateStepPanel("3. Ping, драйвер и TCP/IP порт", _networkStatusLabel);
         var buttons = GetButtonHost(panel);
         buttons.Controls.Add(CreateButton("Проверить ping", CheckNetworkConnection));
+        buttons.Controls.Add(CreateButton("Скачать и установить драйвер", DownloadDriver));
         buttons.Controls.Add(CreateButton("Создать TCP/IP порт", CheckNetworkAndCreatePort));
-        buttons.Controls.Add(CreateButton("Скачать драйвер", DownloadDriver));
         return panel;
     }
 
@@ -784,7 +820,6 @@ public partial class Form1 : Form
         {
             SetStatus(_usbStatusLabel, "Подключен", StatusKind.Good);
             Log($"Найден нужный USB-принтер Windows: {modelUsbPrinter.Name}, порт {modelUsbPrinter.Port}, драйвер {modelUsbPrinter.Driver}.");
-            TryReadEthernetSettingsAfterUsbCheck();
             return;
         }
 
@@ -795,7 +830,6 @@ public partial class Form1 : Form
             SetStatus(_usbStatusLabel, "USB найден", StatusKind.Warning);
             Log("Физическое USB-устройство найдено, но принтер Windows с подходящим драйвером не найден.");
             Log("Скорее всего нужно установить драйвер выбранной модели.");
-            TryReadEthernetSettingsAfterUsbCheck();
             return;
         }
 
@@ -850,7 +884,7 @@ public partial class Form1 : Form
         InvokeIfNeeded(() => _ethernetIpBox.Text = candidate.ToString());
         FillEthernetFromCurrentNetwork();
         SetStatus(_freeIpStatusLabel, "Найден", StatusKind.Good);
-        Log($"Свободный IP для принтера: {candidate}. Адрес подставлен в раздел Ethernet.");
+        Log($"Свободный IP для принтера: {candidate}. Маска и шлюз показаны во втором шаге.");
     }
 
     private void FillEthernetFromCurrentNetwork()
@@ -917,16 +951,67 @@ public partial class Form1 : Form
         }
 
         var dhcpEnabled = GetText(_ethernetDhcpBox).Equals("Включено", StringComparison.OrdinalIgnoreCase);
+        var currentNetworkIp = GetReachablePrinterIpForSdk();
+
+        if (!string.IsNullOrWhiteSpace(currentNetworkIp) &&
+            !currentNetworkIp.Equals(ip, StringComparison.OrdinalIgnoreCase))
+        {
+            Log($"Текущий адрес принтера в Windows: {currentNetworkIp}. После подключения ему будет назначен {ip}.");
+        }
 
         try
         {
-            var portSetting = HprtSdk.SetEthernet(GetHprtSdkPrinterModel(), dhcpEnabled, ip, mask, gateway, GetReachablePrinterIpForSdk());
-            Log($"Ethernet-настройки отправлены в принтер через {FormatSdkPort(portSetting)}. Перезагрузи принтер, затем подключи его к сети и проверь ping.");
+            var model = GetHprtSdkPrinterModel();
+            var portSetting = HprtSdk.SetEthernet(model, dhcpEnabled, ip, mask, gateway, currentNetworkIp);
+            Log($"Все Ethernet-команды переданы в принтер через {FormatSdkPort(portSetting)}.");
+            VerifyEthernetSettingsAfterApply(model, portSetting, dhcpEnabled, ip, mask, gateway);
         }
         catch (Exception ex)
         {
             Log("Не удалось отправить Ethernet-настройки в принтер: " + ex.Message);
         }
+    }
+
+    private void VerifyEthernetSettingsAfterApply(
+        string model,
+        string portSetting,
+        bool dhcpEnabled,
+        string ip,
+        string mask,
+        string gateway)
+    {
+        if (!portSetting.Equals("USB", StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus(_networkStatusLabel, "Ожидает ping", StatusKind.Warning);
+            Log("Настройки переданы по сети. Их применение нужно подтвердить после перезагрузки принтера кнопкой 'Проверить ping'.");
+            return;
+        }
+
+        try
+        {
+            var actual = HprtSdk.TryReadEthernet(model, null);
+            var matches = actual.DhcpEnabled == dhcpEnabled &&
+                (dhcpEnabled ||
+                    (Ipv4Equals(actual.Ip, ip) &&
+                     Ipv4Equals(actual.Mask, mask) &&
+                     Ipv4Equals(actual.Gateway, gateway)));
+
+            if (matches)
+            {
+                Log("Ethernet-настройки подтверждены повторным чтением по USB.");
+            }
+            else
+            {
+                Log("Команды переданы, но повторное чтение пока не подтвердило новые значения. Возможно, принтер применит их после перезагрузки.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("Команды переданы, но автоматически перечитать настройки не удалось: " + ex.Message);
+        }
+
+        SetStatus(_networkStatusLabel, "Ожидает ping", StatusKind.Warning);
+        Log("Перезагрузи принтер, подключи его к сети и нажми 'Проверить ping' для окончательной проверки.");
     }
 
     private void ReadPrinterSettings()
@@ -1012,15 +1097,18 @@ public partial class Form1 : Form
         using var ping = new Ping();
         Log($"Проверяю подключение по сети: {ip}...");
         var reply = ping.Send(ip, 2500);
-        if (reply.Status == IPStatus.Success)
+        var printerPortOpen = IsTcpPortOpen(ip, 9100, 2000);
+        var hasMacAddress = TryGetArpMac(IPAddress.Parse(ip), out _);
+
+        if (printerPortOpen && hasMacAddress)
         {
             SetStatus(_networkStatusLabel, "Подключен", StatusKind.Good);
-            Log($"Сеть OK: принтер отвечает, {reply.RoundtripTime} ms.");
+            Log($"Принтер по сети отвечает, {reply.RoundtripTime} ms.");
         }
         else
         {
             SetStatus(_networkStatusLabel, "Не подключен", StatusKind.Bad);
-            Log($"Принтер по сети не отвечает: {reply.Status}.");
+            Log("Принтер по сети не отвечает.");
         }
     }
 
@@ -1030,18 +1118,50 @@ public partial class Form1 : Form
         if (ip is null)
             return;
 
-        using var ping = new Ping();
-        Log($"Проверяю ping перед созданием принтера: {ip}...");
-        var reply = ping.Send(ip, 2500);
-        if (reply.Status != IPStatus.Success)
+        Log($"Проверяю принтер перед созданием TCP/IP-порта: {ip}...");
+        var hasMacAddress = TryGetArpMac(IPAddress.Parse(ip), out _);
+        if (!hasMacAddress || !IsTcpPortOpen(ip, 9100, 2000))
         {
             SetStatus(_networkStatusLabel, "Не подключен", StatusKind.Bad);
-            Log("Принтер по сети не отвечает. Сначала назначь IP в утилите, отключи USB и подключи принтер к сети.");
+            Log("Принтер по сети не отвечает. TCP/IP-порт Windows не создан.");
+            Log("Сначала назначь IP в утилите, отключи USB и подключи принтер к сети.");
             return;
         }
 
         SetStatus(_networkStatusLabel, "Подключен", StatusKind.Good);
         CreateTcpIpPort();
+    }
+
+    private static bool IsTcpPortOpen(string ip, int port, int timeoutMilliseconds)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cancellation = new CancellationTokenSource(timeoutMilliseconds);
+            client.ConnectAsync(ip, port, cancellation.Token).AsTask().GetAwaiter().GetResult();
+            return client.Connected;
+        }
+        catch (Exception ex) when (ex is SocketException or OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetArpMac(IPAddress address, out string macAddress)
+    {
+        macAddress = "";
+        if (address.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+
+        var bytes = new byte[6];
+        var length = bytes.Length;
+        var destination = BitConverter.ToUInt32(address.GetAddressBytes(), 0);
+        var result = SendARP(destination, 0, bytes, ref length);
+        if (result != 0 || length <= 0)
+            return false;
+
+        macAddress = string.Join("-", bytes.Take(length).Select(x => x.ToString("X2")));
+        return !macAddress.Equals("00-00-00-00-00-00", StringComparison.OrdinalIgnoreCase);
     }
 
     private static List<PrinterRow> GetPrinterRows()
@@ -1054,6 +1174,19 @@ public partial class Form1 : Form
                 fields.ElementAtOrDefault(1) ?? "",
                 fields.ElementAtOrDefault(2) ?? "",
                 PrinterStatusToText(fields.ElementAtOrDefault(3))))
+            .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+            .Where(x => !IsPowerShellMetadataRow(x.Name))
+            .ToList();
+    }
+
+    private static List<TcpIpPrinterPortRow> GetTcpIpPrinterPortRows()
+    {
+        var output = RunPowerShell("(Get-CimInstance Win32_TCPIPPrinterPort | Select-Object Name,HostAddress | ConvertTo-Csv -NoTypeInformation)");
+        return ParseCsv(output)
+            .Skip(1)
+            .Select(fields => new TcpIpPrinterPortRow(
+                fields.ElementAtOrDefault(0) ?? "",
+                fields.ElementAtOrDefault(1) ?? ""))
             .Where(x => !string.IsNullOrWhiteSpace(x.Name))
             .Where(x => !IsPowerShellMetadataRow(x.Name))
             .ToList();
@@ -1149,17 +1282,8 @@ public partial class Form1 : Form
             if (text == gateway || text == local)
                 continue;
 
-            using var ping = new Ping();
-            try
-            {
-                var reply = ping.Send(candidate, 180);
-                if (reply.Status != IPStatus.Success)
-                    return candidate;
-            }
-            catch
-            {
+            if (!TryGetArpMac(candidate, out _))
                 return candidate;
-            }
         }
 
         return null;
@@ -1283,6 +1407,70 @@ public partial class Form1 : Form
         }
     }
 
+    private void DownloadOrRunUtility()
+    {
+        var model = _models[GetSelectedModel()];
+        if (!model.Name.Equals("ATOL DD340", StringComparison.OrdinalIgnoreCase))
+        {
+            Log("Автоматическое скачивание утилиты пока настроено только для ATOL DD340.");
+            OpenUrl(model.UtilityUrl);
+            return;
+        }
+
+        var targetDirectory = GetLabelPrinterDirectory();
+        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        var developmentUtility = Path.Combine(documents, "HPRTPrinterUtility", "HPRTPrinterUtility.exe");
+        var utilityPath = FindFile(targetDirectory, "HPRTPrinterUtility.exe") ??
+            (File.Exists(developmentUtility) ? developmentUtility : null);
+        if (!string.IsNullOrWhiteSpace(utilityPath))
+        {
+            Log("Утилита уже установлена. Открываю и подготавливаю настройки.");
+            OpenAndPrepareHprtUtility(utilityPath);
+            return;
+        }
+
+        var archivePath = Path.Combine(targetDirectory, Dd340UtilityFileName);
+        try
+        {
+            Log("Скачиваю утилиту для ATOL DD340...");
+            DownloadGoogleDriveFile(Dd340UtilityGoogleDriveFileId, archivePath);
+            Log("Распаковываю утилиту в: " + targetDirectory);
+            ZipFile.ExtractToDirectory(archivePath, targetDirectory, true);
+
+            utilityPath = FindFile(targetDirectory, "HPRTPrinterUtility.exe");
+            if (string.IsNullOrWhiteSpace(utilityPath))
+                throw new FileNotFoundException("В архиве не найден HPRTPrinterUtility.exe.");
+
+            File.Delete(archivePath);
+            Log("Утилита готова. Открываю и подготавливаю настройки.");
+            OpenAndPrepareHprtUtility(utilityPath);
+        }
+        catch (Exception ex)
+        {
+            Log("Не удалось скачать или запустить утилиту: " + ex.Message);
+            Log("Открываю папку Google Drive для ручного скачивания.");
+            OpenUrl(model.DriverUrl);
+        }
+    }
+
+    private void OpenAndPrepareHprtUtility(string utilityPath)
+    {
+        var ip = GetText(_ethernetIpBox);
+        var mask = GetText(_ethernetMaskBox);
+        var gateway = GetText(_ethernetGatewayBox);
+        var usbDevices = GetUsbDeviceRows();
+        var printerConnectedByUsb = usbDevices.Any(IsLikelyUsbDeviceForSelectedModel) ||
+            usbDevices.Any(IsGenericUsbPrinterDevice);
+
+        HprtUtilityAutomation.OpenAndPrepare(
+            utilityPath,
+            ip,
+            mask,
+            gateway,
+            printerConnectedByUsb,
+            Log);
+    }
+
     private void DownloadDriver()
     {
         var model = _models[GetSelectedModel()];
@@ -1294,123 +1482,151 @@ public partial class Form1 : Form
             return;
         }
 
-        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        var destination = Path.Combine(documents, model.DriverFileName);
-        var extractDirectory = Path.Combine(documents, Path.GetFileNameWithoutExtension(model.DriverFileName));
-        Directory.CreateDirectory(documents);
+        var targetDirectory = GetLabelPrinterDirectory();
+        var destination = Path.Combine(targetDirectory, model.DriverFileName);
+        var extractDirectory = Path.Combine(targetDirectory, Path.GetFileNameWithoutExtension(model.DriverFileName));
 
         try
         {
-            if (!File.Exists(destination) || new FileInfo(destination).Length == 0)
+            if (!Directory.Exists(extractDirectory) ||
+                !Directory.EnumerateFiles(extractDirectory, "*", SearchOption.AllDirectories).Any())
             {
                 Log("Скачиваю драйвер для " + model.Name + "...");
-                Log("Путь сохранения: " + destination);
+                Log("Папка сохранения: " + targetDirectory);
                 DownloadGoogleDriveFile(model.DriverGoogleDriveFileId, destination);
-                Log("Драйвер скачан: " + destination);
+                Directory.CreateDirectory(extractDirectory);
+                Log("Распаковываю драйвер...");
+                ZipFile.ExtractToDirectory(destination, extractDirectory, true);
+                File.Delete(destination);
             }
             else
             {
-                Log("Архив драйвера уже скачан: " + destination);
+                Log("Файлы драйвера уже скачаны.");
             }
 
-            var installerPath = ExtractDriverInstaller(destination, extractDirectory);
-            if (!TryInstallDriverSilently(installerPath, out var installerWasOpened))
-            {
-                if (!installerWasOpened)
-                    RunDriverInstaller(installerPath);
-
-                Log("Создаю TCP/IP порт Windows по IP из раздела Ethernet.");
-                CreateTcpIpPort();
-            }
+            InstallSelectedDriverSilently(extractDirectory);
         }
         catch (Exception ex)
         {
-            Log("Не удалось выполнить установку драйвера: " + ex.Message);
-            Log("Открываю папку Google Drive, можно скачать файл вручную.");
-            OpenUrl(model.DriverUrl);
+            Log("Не удалось скачать или установить драйвер: " + ex.Message);
         }
     }
 
-    private string ExtractDriverInstaller(string archivePath, string extractDirectory)
+    private static string GetLabelPrinterDirectory()
     {
-        Directory.CreateDirectory(extractDirectory);
-
-        var installer = Directory
-            .EnumerateFiles(extractDirectory, "*.exe", SearchOption.AllDirectories)
-            .FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(installer))
-        {
-            Log("Установщик драйвера уже распакован: " + installer);
-            return installer;
-        }
-
-        Log("Распаковываю архив драйвера...");
-        ZipFile.ExtractToDirectory(archivePath, extractDirectory, true);
-
-        installer = Directory
-            .EnumerateFiles(extractDirectory, "*.exe", SearchOption.AllDirectories)
-            .OrderByDescending(x => Path.GetFileName(x).Contains("HPRT", StringComparison.OrdinalIgnoreCase))
-            .FirstOrDefault();
-
-        if (string.IsNullOrWhiteSpace(installer))
-            throw new FileNotFoundException("В архиве драйвера не найден exe-установщик.");
-
-        Log("Установщик найден: " + installer);
-        return installer;
+        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        var directory = Path.Combine(documents, "Label_printer");
+        Directory.CreateDirectory(directory);
+        return directory;
     }
 
-    private bool TryInstallDriverSilently(string packageInstallerPath, out bool installerWasOpened)
+    private static string? FindFile(string directory, string fileName)
     {
-        installerWasOpened = false;
-        var ip = GetPrinterIp();
-        if (ip is null)
-            return false;
+        if (!Directory.Exists(directory))
+            return null;
 
-        var packageDirectory = Path.GetDirectoryName(packageInstallerPath) ?? Environment.CurrentDirectory;
-        var driverWizard = FindDriverWizard(packageDirectory) ?? FindInstalledSeagullDriverWizard();
-        if (string.IsNullOrWhiteSpace(driverWizard))
+        return Directory
+            .EnumerateFiles(directory, fileName, SearchOption.AllDirectories)
+            .FirstOrDefault();
+    }
+
+    private static void RunFile(string filePath)
+    {
+        Process.Start(new ProcessStartInfo(filePath)
         {
-            var extractedDirectory = Path.Combine(packageDirectory, "Extracted");
-            TryExtractSeagullPackage(packageInstallerPath, extractedDirectory);
-            driverWizard = FindDriverWizard(extractedDirectory) ?? FindInstalledSeagullDriverWizard();
+            UseShellExecute = true,
+            WorkingDirectory = Path.GetDirectoryName(filePath) ?? Environment.CurrentDirectory
+        });
+    }
+
+    private void InstallSelectedDriverSilently(string packageDirectory)
+    {
+        if (!IsAtolDd340Selected())
+        {
+            Log("Тихая установка пока настроена только для ATOL DD340.");
+            return;
         }
 
-        if (string.IsNullOrWhiteSpace(driverWizard))
+        const string driverName = "HPRT HD200 - ZPL";
+        if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
         {
-            Log("Распакованные файлы Seagull не найдены. Открою распаковщик драйвера.");
-            RunDriverInstaller(packageInstallerPath);
-            installerWasOpened = true;
-            driverWizard = FindDriverWizard(packageDirectory) ?? FindInstalledSeagullDriverWizard();
+            Log("Драйвер HPRT HD200 - ZPL уже установлен.");
+            RefreshPrinters();
+            return;
         }
 
-        if (string.IsNullOrWhiteSpace(driverWizard))
+        if (!IsRunningAsAdministrator())
         {
-            Log("Тихая установка недоступна: DriverWizard.exe не найден после распаковки.");
-            return false;
+            Log("Для тихой установки драйвера запусти программу от имени администратора.");
+            return;
         }
 
-        var portName = CreateTcpIpPortOnly();
-        if (string.IsNullOrWhiteSpace(portName))
-            return false;
-
-        var roleName = GetSelectedRole();
-        foreach (var modelName in GetSilentDriverModelCandidates())
+        var driverWizard = PrepareDriverWizard(packageDirectory);
+        if (string.IsNullOrWhiteSpace(driverWizard))
         {
-            Log($"Пробую тихо установить драйвер: {modelName}.");
-            var args = $"install /name:\"{roleName}\" /model:\"{modelName}\" /port:\"{portName}\"";
-            var exitCode = RunElevatedProcess(driverWizard, args, Path.GetDirectoryName(driverWizard));
-            if (exitCode == 0)
+            Log("Не удалось подготовить DriverWizard.exe для тихой установки.");
+            return;
+        }
+
+        var temporaryPrinterName = "ThermoPrinterTool Driver Setup " + Environment.ProcessId;
+        var driverInstalled = false;
+        try
+        {
+            Log("Устанавливаю драйвер HPRT HD200 - ZPL...");
+            var arguments = $"install /name:\"{temporaryPrinterName}\" /model:\"{driverName}\" /port:\"LPT1:\"";
+            var exitCode = RunProcess(driverWizard, arguments, Path.GetDirectoryName(driverWizard));
+            if (exitCode != 0)
             {
-                Log("Драйвер установлен и принтер создан через DriverWizard.");
-                RefreshPrinters();
-                return true;
+                Log($"Не удалось тихо установить драйвер. Код DriverWizard: {exitCode}.");
+                return;
             }
 
-            Log($"DriverWizard вернул код {exitCode} для модели {modelName}.");
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    driverInstalled = true;
+                    break;
+                }
+
+                Thread.Sleep(500);
+            }
+        }
+        finally
+        {
+            RemoveTemporaryPrinter(temporaryPrinterName);
         }
 
-        Log("Тихая установка не сработала, открою обычный установщик.");
-        return false;
+        if (driverInstalled)
+        {
+            Log("Драйвер HPRT HD200 - ZPL установлен.");
+            RefreshPrinters();
+        }
+        else
+        {
+            Log("DriverWizard завершился без ошибки, но драйвер HPRT HD200 - ZPL не найден в Windows.");
+        }
+    }
+
+    private string? PrepareDriverWizard(string packageDirectory)
+    {
+        var driverWizard = FindDriverWizard(packageDirectory) ?? FindInstalledSeagullDriverWizard();
+        if (!string.IsNullOrWhiteSpace(driverWizard))
+            return driverWizard;
+
+        var packageInstaller = Directory
+            .EnumerateFiles(packageDirectory, "*.exe", SearchOption.AllDirectories)
+            .Where(path => !Path.GetFileName(path).Equals("DriverWizard.exe", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(path => Path.GetFileName(path).Contains("HPRT", StringComparison.OrdinalIgnoreCase))
+            .FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(packageInstaller))
+            return null;
+
+        var extractedDirectory = Path.Combine(packageDirectory, "Seagull");
+        if (!TryExtractSeagullPackage(packageInstaller, extractedDirectory))
+            return null;
+
+        return FindDriverWizard(extractedDirectory) ?? FindInstalledSeagullDriverWizard();
     }
 
     private static string? FindDriverWizard(string directory)
@@ -1437,7 +1653,7 @@ public partial class Form1 : Form
             .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path));
     }
 
-    private void TryExtractSeagullPackage(string packageInstallerPath, string extractedDirectory)
+    private bool TryExtractSeagullPackage(string packageInstallerPath, string extractedDirectory)
     {
         try
         {
@@ -1446,37 +1662,24 @@ public partial class Form1 : Form
             Log(exitCode == 0
                 ? "Пакет драйвера распакован для тихой установки."
                 : $"Не удалось тихо распаковать пакет драйвера, код {exitCode}.");
+            return exitCode == 0;
         }
         catch (Exception ex)
         {
             Log("Не удалось подготовить тихую установку: " + ex.Message);
+            return false;
         }
     }
 
-    private IEnumerable<string> GetSilentDriverModelCandidates()
+    private static bool IsRunningAsAdministrator()
     {
-        return GetSelectedModel() switch
-        {
-            "ATOL DD340" => new[] { "HPRT HD200", "HD200", "ATOL DD340" },
-            _ => new[] { GetSelectedModel() }
-        };
+        using var identity = WindowsIdentity.GetCurrent();
+        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    private void RunDriverInstaller(string installerPath)
+    private static void RemoveTemporaryPrinter(string printerName)
     {
-        Log("Запускаю установщик драйвера. Если Windows спросит разрешение, нажми Да.");
-        using var process = Process.Start(new ProcessStartInfo(installerPath)
-        {
-            UseShellExecute = true,
-            Verb = "runas",
-            WorkingDirectory = Path.GetDirectoryName(installerPath) ?? Environment.CurrentDirectory
-        });
-
-        if (process is null)
-            throw new InvalidOperationException("Не удалось запустить установщик драйвера.");
-
-        process.WaitForExit();
-        Log("Установщик драйвера закрыт.");
+        RunPowerShell("Remove-Printer -Name '" + EscapePowerShell(printerName) + "' -ErrorAction SilentlyContinue");
     }
 
     private static void DownloadGoogleDriveFile(string fileId, string destination)
@@ -1582,7 +1785,9 @@ public partial class Form1 : Form
 
         if (string.IsNullOrWhiteSpace(driverName))
         {
-            Log("Не удалось создать принтер Windows: установи драйвер для выбранной модели, затем повтори создание порта.");
+            Log(IsAtolDd340Selected()
+                ? "Драйвер HPRT HD200 - ZPL не установлен. Сначала нажми 'Скачать и установить драйвер'."
+                : "Не удалось создать принтер Windows: установи драйвер выбранной модели и повтори создание порта.");
             return;
         }
 
@@ -1591,16 +1796,16 @@ public partial class Form1 : Form
             "if ($null -eq $printer) { " +
             "if ($null -ne $printerOnPort) { " +
             "Rename-Printer -Name $printerOnPort.Name -NewName '" + EscapePowerShell(roleName) + "'; " +
-            "Set-Printer -Name '" + EscapePowerShell(roleName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
+            "Set-Printer -Name '" + EscapePowerShell(roleName) + "' -DriverName '" + EscapePowerShell(driverName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
             "} else { " +
             "Add-Printer -Name '" + EscapePowerShell(roleName) + "' -DriverName '" + EscapePowerShell(driverName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
             "} " +
             "} else { " +
-            "Set-Printer -Name '" + EscapePowerShell(roleName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
+            "Set-Printer -Name '" + EscapePowerShell(roleName) + "' -DriverName '" + EscapePowerShell(driverName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
             "}";
         var output = RunPowerShell(script);
         Log(string.IsNullOrWhiteSpace(output)
-            ? $"Принтер Windows готов: {roleName}"
+            ? $"Принтер Windows готов: {roleName}, драйвер {driverName}, порт {portName}."
             : output.Trim());
     }
 
@@ -1636,13 +1841,22 @@ public partial class Form1 : Form
 
     private string? FindBestDriverName()
     {
+        var installedDrivers = GetPrinterDriverNames();
+        if (IsAtolDd340Selected())
+        {
+            return installedDrivers.FirstOrDefault(x =>
+                    x.Equals("HPRT HD200 - ZPL", StringComparison.OrdinalIgnoreCase)) ??
+                installedDrivers.FirstOrDefault(x =>
+                    x.Contains("HPRT HD200", StringComparison.OrdinalIgnoreCase) &&
+                    x.Contains("ZPL", StringComparison.OrdinalIgnoreCase));
+        }
+
         var printers = GetPrinterRows();
         var printer = FindBestInstalledPrinterForModel(printers);
         if (!string.IsNullOrWhiteSpace(printer?.Driver))
             return printer.Driver;
 
-        return GetPrinterDriverNames()
-            .FirstOrDefault(IsLikelyDriverForSelectedModel);
+        return installedDrivers.FirstOrDefault(IsLikelyDriverForSelectedModel);
     }
 
     private PrinterRow? FindBestInstalledPrinterForModel(List<PrinterRow> printers)
@@ -1660,10 +1874,10 @@ public partial class Form1 : Form
         var model = GetSelectedModel();
         var keywords = model switch
         {
-            "ATOL DD340" => new[] { "ATOL", "DD340", "Seagull", "HPRT", "HD200" },
-            "ATOL BP41" => new[] { "ATOL", "BP41" },
-            "TSC DA220" => new[] { "TSC", "DA220", "Seagull" },
-            "BIXOLON XD3-40d" => new[] { "BIXOLON", "XD3", "40" },
+            "ATOL DD340" => new[] { "DD340", "HD200" },
+            "ATOL BP41" => new[] { "BP41" },
+            "TSC DA220" => new[] { "DA220" },
+            "BIXOLON XD3-40d" => new[] { "XD3-40", "XD3" },
             _ => model.Split(' ', StringSplitOptions.RemoveEmptyEntries)
         };
 
@@ -1682,9 +1896,9 @@ public partial class Form1 : Form
     private string? GetPrinterIp()
     {
         var ip = GetText(_ethernetIpBox);
-        if (!IPAddress.TryParse(ip, out _))
+        if (!TryParseIpv4(ip, out _))
         {
-            Log("Укажи IP-адрес в разделе Ethernet или нажми 'Найти свободный IP'.");
+            Log("Сначала нажми 'Найти свободный IP'.");
             return null;
         }
         return ip;
@@ -1692,20 +1906,77 @@ public partial class Form1 : Form
 
     private string? GetReachablePrinterIpForSdk()
     {
-        var ip = GetText(_ethernetIpBox);
-        if (!IPAddress.TryParse(ip, out _))
-            return null;
+        var candidates = new List<string>();
+        var printers = GetPrinterRows();
+        var roleName = GetSelectedRole();
+        var matchingPrinters = printers
+            .Where(x => x.Name.Equals(roleName, StringComparison.OrdinalIgnoreCase) ||
+                IsConfiguredDd340Printer(x))
+            .OrderByDescending(x => x.Name.Equals(roleName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var tcpIpPorts = GetTcpIpPrinterPortRows()
+            .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.First().HostAddress, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var printer in matchingPrinters)
+        {
+            if (tcpIpPorts.TryGetValue(printer.Port, out var hostAddress))
+                AddIpv4Candidate(candidates, hostAddress);
+
+            AddIpv4Candidate(candidates, printer.Port);
+            if (printer.Port.StartsWith("IP_", StringComparison.OrdinalIgnoreCase))
+                AddIpv4Candidate(candidates, printer.Port[3..]);
+        }
+
+        AddIpv4Candidate(candidates, GetText(_ethernetIpBox));
+
+        return candidates
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(IsIpv4Reachable);
+    }
+
+    private static bool IsConfiguredDd340Printer(PrinterRow printer)
+    {
+        var text = printer.Name + " " + printer.Driver;
+        return text.Contains("DD340", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("HD200", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void AddIpv4Candidate(List<string> candidates, string value)
+    {
+        if (TryParseIpv4(value, out var address))
+            candidates.Add(address.ToString());
+    }
+
+    private static bool IsIpv4Reachable(string ip)
+    {
+        if (!TryParseIpv4(ip, out _))
+            return false;
 
         try
         {
             using var ping = new Ping();
             var reply = ping.Send(ip, 700);
-            return reply.Status == IPStatus.Success ? ip : null;
+            return reply.Status == IPStatus.Success;
         }
         catch
         {
-            return null;
+            return false;
         }
+    }
+
+    private static bool Ipv4Equals(string left, string right) =>
+        TryParseIpv4(left, out var leftAddress) &&
+        TryParseIpv4(right, out var rightAddress) &&
+        leftAddress.Equals(rightAddress);
+
+    private static bool TryParseIpv4(string value, out IPAddress address)
+    {
+        var success = IPAddress.TryParse(value, out var parsed) &&
+            parsed.AddressFamily == AddressFamily.InterNetwork;
+        address = success ? parsed! : IPAddress.None;
+        return success;
     }
 
     private static string FormatSdkPort(string portSetting)
@@ -1735,7 +2006,7 @@ public partial class Form1 : Form
 
     private bool ValidateEthernetAddress(string value, string label)
     {
-        if (IPAddress.TryParse(value, out _))
+        if (TryParseIpv4(value, out _))
             return true;
 
         Log($"{label}: укажи корректный IPv4 адрес.");
@@ -1862,22 +2133,6 @@ public partial class Form1 : Form
         return process.ExitCode;
     }
 
-    private static int RunElevatedProcess(string fileName, string arguments, string? workingDirectory)
-    {
-        using var process = Process.Start(new ProcessStartInfo(fileName, arguments)
-        {
-            UseShellExecute = true,
-            Verb = "runas",
-            WorkingDirectory = workingDirectory ?? Environment.CurrentDirectory
-        });
-
-        if (process is null)
-            return -1;
-
-        process.WaitForExit();
-        return process.ExitCode;
-    }
-
     private static string RemovePowerShellXmlNoise(string text)
     {
         var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
@@ -1964,6 +2219,8 @@ public partial class Form1 : Form
 
     private sealed record PrinterRow(string Name, string Port, string Driver, string Status);
 
+    private sealed record TcpIpPrinterPortRow(string Name, string HostAddress);
+
     private sealed record UsbDeviceRow(string Name, string Manufacturer, string PnpDeviceId, string Status);
 
     private sealed record NetworkInfo(string AdapterName, IPAddress Address, IPAddress? Mask, IPAddress? Gateway);
@@ -2002,12 +2259,21 @@ public partial class Form1 : Form
     private static class HprtSdk
     {
         private const string DllPath = "ESC_SDK.dll";
+        private const string HprtIoDllPath = "hprtio.dll";
         private const int LangId = 0;
         private const string UsbPort = "USB";
         private const string ResourcePrefix = "HPRT.";
         private const CharSet SdkCharSet = CharSet.Unicode;
         private static readonly object NativeLock = new();
         private static string? _nativeDirectory;
+
+        private sealed class PartialHprtWriteException : InvalidOperationException
+        {
+            public PartialHprtWriteException(string message, Exception innerException)
+                : base(message, innerException)
+            {
+            }
+        }
 
         static HprtSdk()
         {
@@ -2044,15 +2310,166 @@ public partial class Form1 : Form
         [DllImport(DllPath, CharSet = SdkCharSet)]
         private static extern int SendCommand(IntPtr printer, string command);
 
+        [DllImport(HprtIoDllPath, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi, ExactSpelling = true)]
+        private static extern int hprt_io_port_creator(out IntPtr port, string uri);
+
+        [DllImport(HprtIoDllPath, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        private static extern int hprt_io_port_destroy(IntPtr port);
+
+        [DllImport(HprtIoDllPath, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        private static extern int hprt_io_open(IntPtr port);
+
+        [DllImport(HprtIoDllPath, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        private static extern int hprt_io_close(IntPtr port);
+
+        [DllImport(HprtIoDllPath, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        private static extern int hprt_io_write(IntPtr port, byte[] buffer, int offset, int length, out int written);
+
         public static string SetEthernet(string model, bool dhcpEnabled, string ip, string mask, string gateway, string? networkIp)
         {
             EnsureX86();
-            var mode = dhcpEnabled ? 1 : 0;
-            return WithOpenAutoPrinter(model, networkIp, printer =>
+            Exception? directError = null;
+            try
             {
-                var result = SetEthernetInfo(printer, mode, ip, mask, gateway);
-                ThrowIfFailed(result, "назначить Ethernet-настройки");
-            });
+                return SetEthernetDirect(dhcpEnabled, ip, mask, gateway, networkIp);
+            }
+            catch (PartialHprtWriteException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                directError = ex;
+            }
+
+            try
+            {
+                var mode = dhcpEnabled ? 1 : 0;
+                return WithOpenAutoPrinter(model, networkIp, printer =>
+                {
+                    var result = SetEthernetInfo(printer, mode, ip, mask, gateway);
+                    ThrowIfFailed(result, "назначить Ethernet-настройки");
+                });
+            }
+            catch (Exception sdkError)
+            {
+                throw new InvalidOperationException(
+                    $"Прямая команда HPRT: {directError?.Message} | ESC SDK: {sdkError.Message}", sdkError);
+            }
+        }
+
+        private static string SetEthernetDirect(bool dhcpEnabled, string ip, string mask, string gateway, string? networkIp)
+        {
+            var errors = new List<string>();
+            foreach (var portSetting in GetPortCandidates(networkIp))
+            {
+                var commandsWritten = 0;
+                try
+                {
+                    WithOpenDirectPort(portSetting, port =>
+                    {
+                        var commands = BuildEthernetCommands(portSetting, dhcpEnabled, ip, mask, gateway);
+
+                        foreach (var command in commands)
+                        {
+                            WriteDirect(port, command);
+                            commandsWritten++;
+                            Thread.Sleep(80);
+                        }
+                    });
+                    return portSetting;
+                }
+                catch (Exception ex)
+                {
+                    if (commandsWritten > 0)
+                    {
+                        throw new PartialHprtWriteException(
+                            $"Передано команд: {commandsWritten} из 4 через {portSetting}. " +
+                            "Повторная отправка другим способом остановлена, чтобы не получить смешанные настройки. " +
+                            "Перезагрузи принтер, прочитай текущие значения и повтори назначение.", ex);
+                    }
+
+                    errors.Add($"{portSetting}: {ex.Message}");
+                }
+            }
+
+            throw new InvalidOperationException("Не удалось отправить прямые команды HPRT. " + string.Join(" | ", errors));
+        }
+
+        private static IReadOnlyList<byte[]> BuildEthernetCommands(
+            string portSetting,
+            bool dhcpEnabled,
+            string ip,
+            string mask,
+            string gateway)
+        {
+            if (!portSetting.StartsWith("NET,", StringComparison.OrdinalIgnoreCase))
+            {
+                return new[]
+                {
+                    HprtEthernetProtocol.BuildDhcp(dhcpEnabled),
+                    HprtEthernetProtocol.BuildIp(ip),
+                    HprtEthernetProtocol.BuildMask(mask),
+                    HprtEthernetProtocol.BuildGateway(gateway)
+                };
+            }
+
+            return dhcpEnabled
+                ? new[]
+                {
+                    HprtEthernetProtocol.BuildMask(mask),
+                    HprtEthernetProtocol.BuildGateway(gateway),
+                    HprtEthernetProtocol.BuildIp(ip),
+                    HprtEthernetProtocol.BuildDhcp(true)
+                }
+                : new[]
+                {
+                    HprtEthernetProtocol.BuildMask(mask),
+                    HprtEthernetProtocol.BuildGateway(gateway),
+                    HprtEthernetProtocol.BuildDhcp(false),
+                    HprtEthernetProtocol.BuildIp(ip)
+                };
+        }
+
+        private static void WithOpenDirectPort(string portSetting, Action<IntPtr> action)
+        {
+            var port = IntPtr.Zero;
+            var opened = false;
+            try
+            {
+                var createResult = hprt_io_port_creator(out port, portSetting);
+                ThrowIfHprtIoFailed(createResult, $"создать порт {portSetting}");
+                if (port == IntPtr.Zero)
+                    throw new InvalidOperationException("hprtio.dll вернула пустой объект порта.");
+
+                var openResult = hprt_io_open(port);
+                ThrowIfHprtIoFailed(openResult, $"открыть порт {portSetting}");
+                opened = true;
+                action(port);
+            }
+            finally
+            {
+                if (opened)
+                    hprt_io_close(port);
+                if (port != IntPtr.Zero)
+                    hprt_io_port_destroy(port);
+            }
+        }
+
+        private static void WriteDirect(IntPtr port, byte[] command)
+        {
+            var result = hprt_io_write(port, command, 0, command.Length, out var written);
+            ThrowIfHprtIoFailed(result, "записать команду в принтер");
+            if (written != command.Length)
+                throw new IOException($"hprtio.dll записала {written} из {command.Length} байт.");
+        }
+
+        private static void ThrowIfHprtIoFailed(int result, string action)
+        {
+            if (result == 0)
+                return;
+
+            throw new InvalidOperationException($"Не удалось {action}. Код hprtio: {result}.");
         }
 
         public static HprtEthernetResult TryReadEthernet(string model, string? networkIp)
@@ -2168,20 +2585,25 @@ public partial class Form1 : Form
 
         private static IntPtr ResolveNativeLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
         {
-            if (!libraryName.Equals(DllPath, StringComparison.OrdinalIgnoreCase))
+            if (!libraryName.Equals(DllPath, StringComparison.OrdinalIgnoreCase) &&
+                !libraryName.Equals(HprtIoDllPath, StringComparison.OrdinalIgnoreCase))
                 return IntPtr.Zero;
 
             var nativeDirectory = EnsureNativeLibrariesExtracted();
-            var sdkPath = Path.Combine(nativeDirectory, DllPath);
-            return NativeLibrary.Load(sdkPath);
+            var libraryPath = Path.Combine(nativeDirectory, libraryName);
+            return NativeLibrary.Load(libraryPath);
         }
 
         private static string EnsureNativeLibrariesExtracted()
         {
             lock (NativeLock)
             {
-                if (!string.IsNullOrWhiteSpace(_nativeDirectory) && File.Exists(Path.Combine(_nativeDirectory, DllPath)))
+                if (!string.IsNullOrWhiteSpace(_nativeDirectory) &&
+                    File.Exists(Path.Combine(_nativeDirectory, DllPath)) &&
+                    File.Exists(Path.Combine(_nativeDirectory, HprtIoDllPath)))
+                {
                     return _nativeDirectory;
+                }
 
                 var version = Assembly.GetExecutingAssembly()
                     .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
@@ -2207,9 +2629,10 @@ public partial class Form1 : Form
                     if (resource is null)
                         continue;
 
-                    if (File.Exists(targetPath) && new FileInfo(targetPath).Length == resource.Length)
+                    if (ResourceMatchesFile(resource, targetPath))
                         continue;
 
+                    resource.Position = 0;
                     using var output = File.Create(targetPath);
                     resource.CopyTo(output);
                 }
@@ -2218,9 +2641,27 @@ public partial class Form1 : Form
                 if (!File.Exists(sdkPath))
                     throw new FileNotFoundException("ESC_SDK.dll не найден среди распакованных HPRT DLL.", sdkPath);
 
+                var hprtIoPath = Path.Combine(targetDirectory, HprtIoDllPath);
+                if (!File.Exists(hprtIoPath))
+                    throw new FileNotFoundException("hprtio.dll не найден среди распакованных HPRT DLL.", hprtIoPath);
+
                 _nativeDirectory = targetDirectory;
                 return targetDirectory;
             }
+        }
+
+        private static bool ResourceMatchesFile(Stream resource, string filePath)
+        {
+            if (!File.Exists(filePath))
+                return false;
+
+            resource.Position = 0;
+            var resourceHash = SHA256.HashData(resource);
+            resource.Position = 0;
+
+            using var file = File.OpenRead(filePath);
+            var fileHash = SHA256.HashData(file);
+            return resourceHash.AsSpan().SequenceEqual(fileHash);
         }
 
         private static void ThrowIfFailed(int result, string action)
