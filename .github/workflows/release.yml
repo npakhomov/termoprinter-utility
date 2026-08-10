@@ -97,3 +97,24 @@ jobs:
               .\release-artifacts\ThermoPrinterTool.zip `
               --clobber
           }
+
+      - name: Update permanent beta download
+        if: steps.version.outputs.prerelease == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $aliasTag = "latest-beta"
+
+          gh release view $aliasTag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $aliasTag --cleanup-tag --yes
+          }
+
+          gh release create $aliasTag `
+            .\release-artifacts\ThermoPrinterTool.exe `
+            .\release-artifacts\ThermoPrinterTool.zip `
+            --target "${{ github.sha }}" `
+            --title "ThermoPrinterTool latest beta" `
+            --notes "Permanent download alias for ${{ steps.version.outputs.tag }}" `
+            --prerelease
