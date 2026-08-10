@@ -53,11 +53,11 @@ public partial class Form1 : Form
             "Driver_ATOL DD340.zip"),
         ["ATOL BP41"] = new(
             "ATOL BP41",
-            "https://portkkm.ru/support/atol-bp41/programs/",
-            "https://portkkm.ru/support/atol-bp41/programs/",
-            "Точную смену IP лучше делать через утилиту производителя или поставщика.",
-            null,
-            null),
+            "https://drive.google.com/drive/folders/1BHnFvJAW7yWbm7AaSs6dHX3nt0nNP6xQ",
+            "https://drive.google.com/drive/folders/1BHnFvJAW7yWbm7AaSs6dHX3nt0nNP6xQ",
+            "",
+            "1So-KEVdDYpGN7B0O4PvLWVlEiFOy4hon",
+            "Driver_ATOL_BP41.zip"),
         ["TSC DA220"] = new(
             "TSC DA220",
             "https://www.bartendersoftware.com/resources/printer-drivers/tsc/tsc-da220",
@@ -212,7 +212,12 @@ public partial class Form1 : Form
         _modelBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _modelBox.Items.AddRange(_models.Keys.Cast<object>().ToArray());
         _modelBox.SelectedIndex = 0;
-        _modelBox.SelectedIndexChanged += (_, _) => Log(_models[_modelBox.Text].Note);
+        _modelBox.SelectedIndexChanged += (_, _) =>
+        {
+            var note = _models[_modelBox.Text].Note;
+            if (!string.IsNullOrWhiteSpace(note))
+                Log(note);
+        };
 
         _printerRoleBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _printerRoleBox.Items.AddRange(new object[]
@@ -714,7 +719,7 @@ public partial class Form1 : Form
             WindowStyle = ProcessWindowStyle.Hidden
         });
 
-        BeginInvoke(() => Close());
+        BeginInvoke(Application.Exit);
     }
 
     private static string NormalizeVersion(string version)
@@ -1410,46 +1415,32 @@ public partial class Form1 : Form
     private void DownloadOrRunUtility()
     {
         var model = _models[GetSelectedModel()];
-        if (!model.Name.Equals("ATOL DD340", StringComparison.OrdinalIgnoreCase))
-        {
-            Log("Автоматическое скачивание утилиты пока настроено только для ATOL DD340.");
-            OpenUrl(model.UtilityUrl);
-            return;
-        }
-
-        var targetDirectory = GetLabelPrinterDirectory();
-        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        var developmentUtility = Path.Combine(documents, "HPRTPrinterUtility", "HPRTPrinterUtility.exe");
-        var utilityPath = FindFile(targetDirectory, "HPRTPrinterUtility.exe") ??
-            (File.Exists(developmentUtility) ? developmentUtility : null);
-        if (!string.IsNullOrWhiteSpace(utilityPath))
-        {
-            Log("Утилита уже установлена. Открываю и подготавливаю настройки.");
-            OpenAndPrepareHprtUtility(utilityPath);
-            return;
-        }
-
-        var archivePath = Path.Combine(targetDirectory, Dd340UtilityFileName);
         try
         {
-            Log("Скачиваю утилиту для ATOL DD340...");
-            DownloadGoogleDriveFile(Dd340UtilityGoogleDriveFileId, archivePath);
-            Log("Распаковываю утилиту в: " + targetDirectory);
-            ZipFile.ExtractToDirectory(archivePath, targetDirectory, true);
+            if (model.Name.Equals("ATOL DD340", StringComparison.OrdinalIgnoreCase))
+            {
+                var utilityPath = Dd340UtilityService.GetOrDownload(Log);
+                Log("Утилита ATOL DD340 готова. Открываю и подготавливаю настройки.");
+                OpenAndPrepareHprtUtility(utilityPath);
+                return;
+            }
 
-            utilityPath = FindFile(targetDirectory, "HPRTPrinterUtility.exe");
-            if (string.IsNullOrWhiteSpace(utilityPath))
-                throw new FileNotFoundException("В архиве не найден HPRTPrinterUtility.exe.");
+            if (model.Name.Equals("ATOL BP41", StringComparison.OrdinalIgnoreCase))
+            {
+                var utilityPath = Bp41UtilityService.GetOrDownload(Log);
+                Log("Открываю RTLabelPrinterTool для ATOL BP41.");
+                Bp41UtilityService.Run(utilityPath);
+                return;
+            }
 
-            File.Delete(archivePath);
-            Log("Утилита готова. Открываю и подготавливаю настройки.");
-            OpenAndPrepareHprtUtility(utilityPath);
+            Log("Автоматическое скачивание утилиты для выбранной модели пока не настроено.");
+            OpenUrl(model.UtilityUrl);
         }
         catch (Exception ex)
         {
             Log("Не удалось скачать или запустить утилиту: " + ex.Message);
             Log("Открываю папку Google Drive для ручного скачивания.");
-            OpenUrl(model.DriverUrl);
+            OpenUrl(model.UtilityUrl);
         }
     }
 
@@ -1541,11 +1532,23 @@ public partial class Form1 : Form
 
     private void InstallSelectedDriverSilently(string packageDirectory)
     {
-        if (!IsAtolDd340Selected())
+        if (IsAtolDd340Selected())
         {
-            Log("Тихая установка пока настроена только для ATOL DD340.");
+            InstallDd340DriverSilently(packageDirectory);
             return;
         }
+
+        if (IsAtolBp41Selected())
+        {
+            InstallBp41DriverSilently(packageDirectory);
+            return;
+        }
+
+        Log("Тихая установка для выбранной модели пока не настроена.");
+    }
+
+    private void InstallDd340DriverSilently(string packageDirectory)
+    {
 
         const string driverName = "HPRT HD200 - ZPL";
         if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
@@ -1605,6 +1608,71 @@ public partial class Form1 : Form
         else
         {
             Log("DriverWizard завершился без ошибки, но драйвер HPRT HD200 - ZPL не найден в Windows.");
+        }
+    }
+
+    private void InstallBp41DriverSilently(string packageDirectory)
+    {
+        const string driverName = "Rongta RP4xx Series";
+        if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
+        {
+            Log("Драйвер Rongta RP4xx Series уже установлен.");
+            RefreshPrinters();
+            return;
+        }
+
+        if (!IsRunningAsAdministrator())
+        {
+            Log("Для тихой установки драйвера запусти программу от имени администратора.");
+            return;
+        }
+
+        var installer = FindFile(packageDirectory, "PrnInst.exe");
+        var infPath = FindFile(packageDirectory, "RONGTAOEM.inf");
+        if (string.IsNullOrWhiteSpace(installer) || string.IsNullOrWhiteSpace(infPath))
+        {
+            Log("В пакете ATOL BP41 не найдены PrnInst.exe или RONGTAOEM.inf.");
+            return;
+        }
+
+        var temporaryPrinterName = "ThermoPrinterTool BP41 Driver Setup " + Environment.ProcessId;
+        var driverInstalled = false;
+        try
+        {
+            Log("Устанавливаю драйвер Rongta RP4xx Series без открытия мастера...");
+            var driverDirectory = Path.GetDirectoryName(infPath)!;
+            var arguments = $"\"/DIR={driverDirectory}\" /NOLICENCE \"/INSTPRN={driverName}#LPT1:#{temporaryPrinterName}\"";
+            var exitCode = RunProcess(installer, arguments, Path.GetDirectoryName(installer));
+            if (exitCode != 0)
+            {
+                Log($"Не удалось тихо установить драйвер. Код PrnInst: {exitCode}.");
+                return;
+            }
+
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    driverInstalled = true;
+                    break;
+                }
+
+                Thread.Sleep(500);
+            }
+        }
+        finally
+        {
+            RemoveTemporaryPrinter(temporaryPrinterName);
+        }
+
+        if (driverInstalled)
+        {
+            Log("Драйвер Rongta RP4xx Series установлен.");
+            RefreshPrinters();
+        }
+        else
+        {
+            Log("PrnInst завершился без ошибки, но драйвер Rongta RP4xx Series не найден в Windows.");
         }
     }
 
@@ -1851,6 +1919,14 @@ public partial class Form1 : Form
                     x.Contains("ZPL", StringComparison.OrdinalIgnoreCase));
         }
 
+        if (IsAtolBp41Selected())
+        {
+            return installedDrivers.FirstOrDefault(x =>
+                    x.Equals("Rongta RP4xx Series", StringComparison.OrdinalIgnoreCase)) ??
+                installedDrivers.FirstOrDefault(x =>
+                    x.Contains("Rongta RP4", StringComparison.OrdinalIgnoreCase));
+        }
+
         var printers = GetPrinterRows();
         var printer = FindBestInstalledPrinterForModel(printers);
         if (!string.IsNullOrWhiteSpace(printer?.Driver))
@@ -1875,7 +1951,7 @@ public partial class Form1 : Form
         var keywords = model switch
         {
             "ATOL DD340" => new[] { "DD340", "HD200" },
-            "ATOL BP41" => new[] { "BP41" },
+            "ATOL BP41" => new[] { "BP41", "RP4xx", "Rongta RP4" },
             "TSC DA220" => new[] { "DA220" },
             "BIXOLON XD3-40d" => new[] { "XD3-40", "XD3" },
             _ => model.Split(' ', StringSplitOptions.RemoveEmptyEntries)
@@ -2000,6 +2076,8 @@ public partial class Form1 : Form
 
     private bool IsAtolDd340Selected() => GetSelectedModel().Equals("ATOL DD340", StringComparison.OrdinalIgnoreCase);
 
+    private bool IsAtolBp41Selected() => GetSelectedModel().Equals("ATOL BP41", StringComparison.OrdinalIgnoreCase);
+
     private string GetHprtSdkPrinterModel() => IsAtolDd340Selected() ? "HD200" : GetSelectedModel();
 
     private static string GetHprtSdkPath() => "ESC_SDK.dll";
@@ -2109,9 +2187,26 @@ public partial class Form1 : Form
         if (process is null)
             return "Не удалось запустить PowerShell.";
 
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit(8000);
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(8000))
+        {
+            try
+            {
+                process.Kill(true);
+            }
+            catch
+            {
+                // The process may have exited between the timeout and Kill.
+            }
+
+            Task.WhenAll(outputTask, errorTask).GetAwaiter().GetResult();
+            return "PowerShell не завершил операцию за 8 секунд.";
+        }
+
+        Task.WhenAll(outputTask, errorTask).GetAwaiter().GetResult();
+        var output = outputTask.Result;
+        var error = errorTask.Result;
         output = RemovePowerShellXmlNoise(output);
         error = RemovePowerShellXmlNoise(error);
         return string.IsNullOrWhiteSpace(error) ? output : output + Environment.NewLine + error;
