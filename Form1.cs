@@ -12,6 +12,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace ThermoPrinterTool;
 
@@ -20,8 +21,12 @@ public partial class Form1 : Form
     private const string GitHubOwner = "npakhomov";
     private const string GitHubRepository = "termoprinter-utility";
     private const string ReleaseAssetName = "ThermoPrinterTool.exe";
+    private const string ReleaseChecksumAssetName = ReleaseAssetName + ".sha256";
     private const string Dd340UtilityGoogleDriveFileId = "13WUMg8DRlzyFaIg8dcE8pL-VFxigdjS7";
     private const string Dd340UtilityFileName = "Utility_ATOL DD340.zip";
+    private static readonly Regex ReleaseVersionPattern = new(
+        @"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$",
+        RegexOptions.CultureInvariant);
 
     [DllImport("iphlpapi.dll", ExactSpelling = true)]
     private static extern int SendARP(uint destinationIp, uint sourceIp, byte[] macAddress, ref int physicalAddressLength);
@@ -626,9 +631,20 @@ public partial class Form1 : Form
                 return;
             }
 
+            var checksumAsset = latestRelease.Assets
+                .FirstOrDefault(x => x.Name.Equals(ReleaseChecksumAssetName, StringComparison.OrdinalIgnoreCase));
+            if (checksumAsset is null || string.IsNullOrWhiteSpace(checksumAsset.BrowserDownloadUrl))
+            {
+                Log($"Найдена версия {latestVersion}, но контрольная сумма {ReleaseChecksumAssetName} отсутствует. Обновление отменено.");
+                return;
+            }
+
             Log($"Найдена новая версия {latestVersion}. Скачиваю обновление...");
-            var updatePath = await DownloadUpdateAssetAsync(asset.BrowserDownloadUrl, latestVersion);
-            Log("Обновление скачано. Программа сейчас перезапустится.");
+            var updatePath = await DownloadUpdateAssetAsync(
+                asset.BrowserDownloadUrl,
+                checksumAsset.BrowserDownloadUrl,
+                latestVersion);
+            Log("Обновление скачано и проверено. Программа сейчас перезапустится.");
             StartSelfUpdate(updatePath);
         }
         catch (Exception ex)
@@ -660,35 +676,92 @@ public partial class Form1 : Form
         var releases = await client.GetFromJsonAsync<List<GitHubRelease>>(url);
         return releases?
             .Where(x => !x.Draft && !string.IsNullOrWhiteSpace(x.TagName))
+            .Where(x => ReleaseVersionPattern.IsMatch(NormalizeVersion(x.TagName)))
             .OrderByDescending(x => ParseVersionForCompare(NormalizeVersion(x.TagName)))
             .FirstOrDefault();
     }
 
-    private static async Task<string> DownloadUpdateAssetAsync(string url, string version)
+    private static async Task<string> DownloadUpdateAssetAsync(string url, string checksumUrl, string version)
     {
+        EnsureGitHubReleaseAssetUrl(url);
+        EnsureGitHubReleaseAssetUrl(checksumUrl);
+
         using var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true });
         client.DefaultRequestHeaders.UserAgent.ParseAdd("ThermoPrinterTool");
         client.Timeout = TimeSpan.FromMinutes(5);
+
+        var expectedHash = await DownloadExpectedSha256Async(client, checksumUrl);
 
         var updateDirectory = Path.Combine(Path.GetTempPath(), "ThermoPrinterTool", "updates");
         Directory.CreateDirectory(updateDirectory);
         var updatePath = Path.Combine(updateDirectory, $"ThermoPrinterTool-{version}.exe");
         var tempPath = updatePath + ".download";
 
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-        response.EnsureSuccessStatusCode();
-
-        await using (var input = await response.Content.ReadAsStreamAsync())
-        await using (var output = File.Create(tempPath))
+        try
         {
-            await input.CopyToAsync(output);
+            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+
+            await using (var input = await response.Content.ReadAsStreamAsync())
+            await using (var output = File.Create(tempPath))
+            {
+                await input.CopyToAsync(output);
+            }
+
+            if (new FileInfo(tempPath).Length == 0)
+                throw new InvalidOperationException("Скачанный файл обновления пустой.");
+
+            await using var updateStream = File.OpenRead(tempPath);
+            var actualHash = Convert.ToHexString(await SHA256.HashDataAsync(updateStream));
+            if (!actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Контрольная сумма обновления не совпадает. Файл не будет запущен.");
+
+            File.Move(tempPath, updatePath, true);
+            return updatePath;
+        }
+        catch
+        {
+            try
+            {
+                File.Delete(tempPath);
+            }
+            catch
+            {
+                // Preserve the original download or validation error.
+            }
+            throw;
+        }
+    }
+
+    private static async Task<string> DownloadExpectedSha256Async(HttpClient client, string url)
+    {
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseContentRead);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is > 1024)
+            throw new InvalidOperationException("Файл контрольной суммы обновления имеет неверный размер.");
+
+        var content = await response.Content.ReadAsStringAsync();
+        if (content.Length > 1024)
+            throw new InvalidOperationException("Файл контрольной суммы обновления имеет неверный размер.");
+        var expectedHash = content.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault();
+        if (expectedHash is null || expectedHash.Length != 64 || expectedHash.Any(character => !Uri.IsHexDigit(character)))
+            throw new InvalidOperationException("Файл контрольной суммы обновления имеет неверный формат.");
+
+        return expectedHash;
+    }
+
+    private static void EnsureGitHubReleaseAssetUrl(string url)
+    {
+        var expectedPathPrefix = $"/{GitHubOwner}/{GitHubRepository}/releases/download/";
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+            uri.Scheme != Uri.UriSchemeHttps ||
+            !uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) ||
+            !uri.AbsolutePath.StartsWith(expectedPathPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("GitHub вернул недопустимый адрес файла обновления.");
         }
 
-        if (new FileInfo(tempPath).Length == 0)
-            throw new InvalidOperationException("Скачанный файл обновления пустой.");
-
-        File.Move(tempPath, updatePath, true);
-        return updatePath;
     }
 
     private void StartSelfUpdate(string updatePath)
