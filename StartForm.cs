@@ -9,8 +9,8 @@ internal sealed class StartForm : Form
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         Text = "ThermoPrinterTool";
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(620, 330);
-        MinimumSize = new Size(620, 330);
+        ClientSize = new Size(620, 365);
+        MinimumSize = new Size(620, 365);
         MaximizeBox = false;
         BackColor = Color.FromArgb(244, 246, 249);
         Font = new Font("Segoe UI", 9F);
@@ -61,7 +61,9 @@ internal sealed class StartForm : Form
 
         root.Controls.Add(new Label
         {
-            Text = "Выберите нужный сценарий",
+            Text = SupportLifetime.WillDeleteOnExit
+                ? "После завершения работы файл утилиты будет удален."
+                : "Рабочая копия разработчика: автоудаление отключено.",
             AutoSize = true,
             ForeColor = Color.FromArgb(92, 101, 115),
             Margin = new Padding(0, 18, 0, 0)

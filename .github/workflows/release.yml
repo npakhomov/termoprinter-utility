@@ -51,11 +51,19 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
-          dotnet-version: "10.0.401"
+          dotnet-version: "10.0.404"
 
       - name: Restore locked dependencies
         shell: pwsh
         run: dotnet restore .\ThermoPrinterTool.csproj --locked-mode -r win-x86
+
+      - name: Run security regression checks
+        shell: pwsh
+        run: |
+          dotnet restore .\Tests\SecurityChecks.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet run --project .\Tests\SecurityChecks.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Publish single-file exe
         shell: pwsh

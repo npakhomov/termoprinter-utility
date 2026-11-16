@@ -94,10 +94,18 @@ internal static class HprtUtilityAutomation
 
     private static Process GetOrStartUtility(string utilityPath)
     {
-        var existing = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(utilityPath))
-            .FirstOrDefault(x => x.MainWindowHandle != IntPtr.Zero);
-        if (existing is not null)
-            return existing;
+        using var current = Process.GetCurrentProcess();
+        foreach (var candidate in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(utilityPath)))
+        {
+            using (candidate)
+            {
+                if (candidate.HasExited || candidate.MainWindowHandle == IntPtr.Zero)
+                    continue;
+                if (candidate.SessionId != current.SessionId)
+                    continue;
+                throw new InvalidOperationException("Закройте ранее запущенную HPRT Printer Utility и повторите запуск проверенной копии.");
+            }
+        }
 
         var process = Process.Start(new ProcessStartInfo(utilityPath)
         {

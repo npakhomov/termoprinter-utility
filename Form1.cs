@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Drawing.Printing;
-using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Net;
@@ -9,7 +8,6 @@ using System.Net.Http.Json;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Security.Principal;
 using System.Text;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -22,8 +20,6 @@ public partial class Form1 : Form
     private const string GitHubRepository = "termoprinter-utility";
     private const string ReleaseAssetName = "ThermoPrinterTool.exe";
     private const string ReleaseChecksumAssetName = ReleaseAssetName + ".sha256";
-    private const string Dd340UtilityGoogleDriveFileId = "13WUMg8DRlzyFaIg8dcE8pL-VFxigdjS7";
-    private const string Dd340UtilityFileName = "Utility_ATOL DD340.zip";
     private static readonly Regex ReleaseVersionPattern = new(
         @"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$",
         RegexOptions.CultureInvariant);
@@ -40,6 +36,11 @@ public partial class Form1 : Form
     private readonly TextBox _ethernetMaskBox = new();
     private readonly TextBox _ethernetGatewayBox = new();
     private readonly TextBox _ethernetMacBox = new();
+    private readonly TextBox _dhcpStartBox = new();
+    private readonly TextBox _dhcpEndBox = new();
+    private readonly UpdateSession _updates = new();
+    private readonly Action<string> _applyUpdate;
+    private int _checkingUpdate;
     private readonly Label _usbStatusLabel = new();
     private readonly Label _freeIpStatusLabel = new();
     private readonly Label _networkStatusLabel = new();
@@ -79,18 +80,35 @@ public partial class Form1 : Form
             null)
     };
 
-    public Form1()
+    public Form1() : this(true) { }
+
+    internal Form1(bool initializeServices, Action<string>? applyUpdate = null)
     {
+        _applyUpdate = applyUpdate ?? StartSelfUpdate;
         InitializeComponent();
         Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         FitWindowToScreen();
         BuildInterface();
-        RefreshNetworkInfo();
-        RefreshPrinters();
+        if (initializeServices)
+        {
+            RefreshNetworkInfo();
+            RefreshPrinters();
+        }
         SetStatus(_usbStatusLabel, "Не проверено", StatusKind.Neutral);
         SetStatus(_freeIpStatusLabel, "Не найден", StatusKind.Neutral);
         SetStatus(_networkStatusLabel, "Не проверено", StatusKind.Neutral);
-        Shown += async (_, _) => await CheckForUpdatesAsync(false);
+        if (initializeServices)
+            Shown += async (_, _) => await CheckForUpdatesAsync(false);
+        FormClosing += (_, e) =>
+        {
+            if (_updates.IsBusy)
+            {
+                e.Cancel = true;
+                Log("Дождитесь завершения текущей операции перед закрытием.");
+            }
+        };
+        FormClosed += (_, _) => _updates.Close();
+        Disposed += (_, _) => _updates.Close();
     }
 
     private void FitWindowToScreen()
@@ -368,7 +386,7 @@ public partial class Form1 : Form
 
     private Control CreateStep2Panel()
     {
-        var panel = CreateStepPanel("2. Свободный IP и утилита", _freeIpStatusLabel);
+        var panel = CreateStepPanel("2. IP-адрес и утилита", _freeIpStatusLabel);
         var layout = panel.Controls.OfType<TableLayoutPanel>().First();
         var buttons = GetButtonHost(panel);
         layout.Controls.Remove(buttons);
@@ -377,7 +395,7 @@ public partial class Form1 : Form
         {
             Dock = DockStyle.Top,
             ColumnCount = 2,
-            RowCount = 3,
+            RowCount = 5,
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 6)
         };
@@ -386,10 +404,24 @@ public partial class Form1 : Form
         ConfigureNetworkResultBox(_ethernetIpBox);
         ConfigureNetworkResultBox(_ethernetMaskBox);
         ConfigureNetworkResultBox(_ethernetGatewayBox);
-        AddRow(networkValues, 0, "Свободный IP", _ethernetIpBox);
+        _ethernetIpBox.ReadOnly = false;
+        AddRow(networkValues, 0, "IP-кандидат", _ethernetIpBox);
         AddRow(networkValues, 1, "Маска", _ethernetMaskBox);
         AddRow(networkValues, 2, "Шлюз", _ethernetGatewayBox);
+        AddRow(networkValues, 3, "DHCP от", _dhcpStartBox);
+        AddRow(networkValues, 4, "DHCP до", _dhcpEndBox);
+        _dhcpStartBox.PlaceholderText = "Пул роутера (если известен)";
+        _dhcpEndBox.PlaceholderText = "Пул роутера (если известен)";
+        _ethernetIpBox.AccessibleName = "IP-кандидат";
+        _dhcpStartBox.AccessibleName = "Начало DHCP-пула";
+        _dhcpEndBox.AccessibleName = "Конец DHCP-пула";
         layout.Controls.Add(networkValues);
+        layout.Controls.Add(new Label
+        {
+            Text = "Закрепите IP за MAC принтера на роутере (DHCP). Для статического IP исключите адрес из DHCP-пула.",
+            AutoSize = true, MaximumSize = new Size(365, 0),
+            ForeColor = Color.FromArgb(143, 92, 0), Margin = new Padding(0, 0, 0, 8)
+        });
         layout.Controls.Add(buttons);
 
         buttons.Controls.Add(CreateButton("Найти свободный IP", FindFreeIp));
@@ -582,6 +614,9 @@ public partial class Form1 : Form
 
     private async Task RunAction(Action action)
     {
+        if (!_updates.TryBeginAction())
+            return;
+        UseWaitCursor = true;
         try
         {
             await Task.Run(action);
@@ -590,24 +625,27 @@ public partial class Form1 : Form
         {
             Log("Ошибка: " + ex.Message);
         }
+        finally
+        {
+            if (!IsDisposed)
+                UseWaitCursor = false;
+            _updates.EndAction();
+            ApplyPendingUpdate();
+        }
     }
 
     private async Task CheckForUpdatesAsync(bool manual)
     {
-        if (GitHubOwner.Equals("CHANGE_ME", StringComparison.OrdinalIgnoreCase))
-        {
-            if (manual)
-                Log("Автообновление не настроено: укажи GitHub owner/repo в коде приложения.");
+        if (Interlocked.CompareExchange(ref _checkingUpdate, 1, 0) != 0)
             return;
-        }
-
+        var cancellationToken = _updates.Token;
         try
         {
             if (manual)
                 Log("Проверяю обновления...");
 
             var currentVersion = GetCurrentAppVersion();
-            var latestRelease = await GetLatestGitHubReleaseAsync();
+            var latestRelease = await GetLatestGitHubReleaseAsync(cancellationToken);
             if (latestRelease is null)
             {
                 if (manual)
@@ -643,15 +681,30 @@ public partial class Form1 : Form
             var updatePath = await DownloadUpdateAssetAsync(
                 asset.BrowserDownloadUrl,
                 checksumAsset.BrowserDownloadUrl,
-                latestVersion);
-            Log("Обновление скачано и проверено. Программа сейчас перезапустится.");
-            StartSelfUpdate(updatePath);
+                latestVersion, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            InvokeIfNeeded(() =>
+            {
+                _updates.Queue(updatePath);
+                Log("Обновление проверено. Перезапуск будет выполнен после текущей операции.");
+                ApplyPendingUpdate();
+            });
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception ex)
         {
             if (manual)
                 Log("Не удалось проверить обновления: " + ex.Message);
         }
+        finally { Interlocked.Exchange(ref _checkingUpdate, 0); }
+    }
+
+    private void ApplyPendingUpdate()
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated || _updates.Token.IsCancellationRequested)
+            return;
+        try { _updates.ApplyPending(_applyUpdate); }
+        catch (Exception ex) { Log("Не удалось применить обновление: " + ex.Message); }
     }
 
     private static string GetCurrentAppVersion()
@@ -666,14 +719,14 @@ public partial class Form1 : Form
         return NormalizeVersion(version ?? "0.0.0");
     }
 
-    private static async Task<GitHubRelease?> GetLatestGitHubReleaseAsync()
+    private static async Task<GitHubRelease?> GetLatestGitHubReleaseAsync(CancellationToken cancellationToken)
     {
         using var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd("ThermoPrinterTool");
         client.Timeout = TimeSpan.FromSeconds(20);
 
         var url = $"https://api.github.com/repos/{GitHubOwner}/{GitHubRepository}/releases";
-        var releases = await client.GetFromJsonAsync<List<GitHubRelease>>(url);
+        var releases = await client.GetFromJsonAsync<List<GitHubRelease>>(url, cancellationToken);
         return releases?
             .Where(x => !x.Draft && !string.IsNullOrWhiteSpace(x.TagName))
             .Where(x => ReleaseVersionPattern.IsMatch(NormalizeVersion(x.TagName)))
@@ -681,7 +734,7 @@ public partial class Form1 : Form
             .FirstOrDefault();
     }
 
-    private static async Task<string> DownloadUpdateAssetAsync(string url, string checksumUrl, string version)
+    private static async Task<string> DownloadUpdateAssetAsync(string url, string checksumUrl, string version, CancellationToken cancellationToken)
     {
         EnsureGitHubReleaseAssetUrl(url);
         EnsureGitHubReleaseAssetUrl(checksumUrl);
@@ -690,32 +743,34 @@ public partial class Form1 : Form
         client.DefaultRequestHeaders.UserAgent.ParseAdd("ThermoPrinterTool");
         client.Timeout = TimeSpan.FromMinutes(5);
 
-        var expectedHash = await DownloadExpectedSha256Async(client, checksumUrl);
+        var expectedHash = await DownloadExpectedSha256Async(client, checksumUrl, cancellationToken);
 
         var updateDirectory = Path.Combine(Path.GetTempPath(), "ThermoPrinterTool", "updates");
         Directory.CreateDirectory(updateDirectory);
-        var updatePath = Path.Combine(updateDirectory, $"ThermoPrinterTool-{version}.exe");
+        var updatePath = Path.Combine(updateDirectory, $"ThermoPrinterTool-{version}-{Guid.NewGuid():N}.exe");
         var tempPath = updatePath + ".download";
 
         try
         {
-            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             response.EnsureSuccessStatusCode();
 
-            await using (var input = await response.Content.ReadAsStreamAsync())
+            await using (var input = await response.Content.ReadAsStreamAsync(cancellationToken))
             await using (var output = File.Create(tempPath))
             {
-                await input.CopyToAsync(output);
+                await input.CopyToAsync(output, cancellationToken);
             }
 
             if (new FileInfo(tempPath).Length == 0)
                 throw new InvalidOperationException("Скачанный файл обновления пустой.");
 
-            await using var updateStream = File.OpenRead(tempPath);
-            var actualHash = Convert.ToHexString(await SHA256.HashDataAsync(updateStream));
+            string actualHash;
+            await using (var updateStream = File.OpenRead(tempPath))
+                actualHash = Convert.ToHexString(await SHA256.HashDataAsync(updateStream, cancellationToken));
             if (!actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Контрольная сумма обновления не совпадает. Файл не будет запущен.");
 
+            cancellationToken.ThrowIfCancellationRequested();
             File.Move(tempPath, updatePath, true);
             return updatePath;
         }
@@ -733,14 +788,14 @@ public partial class Form1 : Form
         }
     }
 
-    private static async Task<string> DownloadExpectedSha256Async(HttpClient client, string url)
+    private static async Task<string> DownloadExpectedSha256Async(HttpClient client, string url, CancellationToken cancellationToken)
     {
-        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseContentRead);
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseContentRead, cancellationToken);
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength is > 1024)
             throw new InvalidOperationException("Файл контрольной суммы обновления имеет неверный размер.");
 
-        var content = await response.Content.ReadAsStringAsync();
+        var content = await response.Content.ReadAsStringAsync(cancellationToken);
         if (content.Length > 1024)
             throw new InvalidOperationException("Файл контрольной суммы обновления имеет неверный размер.");
         var expectedHash = content.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
@@ -766,12 +821,11 @@ public partial class Form1 : Form
 
     private void StartSelfUpdate(string updatePath)
     {
+        if (InvokeRequired || IsDisposed || Disposing || !IsHandleCreated || _updates.Token.IsCancellationRequested || _updates.IsBusy)
+            throw new InvalidOperationException("Окно закрыто или выполняется другая операция.");
         var currentPath = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(currentPath) || !File.Exists(currentPath))
             throw new InvalidOperationException("Не удалось определить путь текущего exe.");
-
-        var scriptPath = Path.Combine(Path.GetTempPath(), "ThermoPrinterTool", "update.ps1");
-        Directory.CreateDirectory(Path.GetDirectoryName(scriptPath)!);
 
         var currentProcessId = Environment.ProcessId;
         var script = new StringBuilder()
@@ -783,16 +837,10 @@ public partial class Form1 : Form
             .AppendLine("Start-Sleep -Milliseconds 500")
             .AppendLine("Copy-Item -LiteralPath $source -Destination $target -Force")
             .AppendLine("Start-Process -FilePath $target")
+            .AppendLine("Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue")
             .ToString();
-        File.WriteAllText(scriptPath, script, Encoding.UTF8);
-
-        Process.Start(new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"")
-        {
-            UseShellExecute = true,
-            WindowStyle = ProcessWindowStyle.Hidden
-        });
-
-        BeginInvoke(Application.Exit);
+        using var updater = SupportLifetime.StartHiddenPowerShell(script);
+        SupportLifetime.CommitRestart(updater, Application.Exit, () => _updates.Token.IsCancellationRequested);
     }
 
     private static string NormalizeVersion(string version)
@@ -950,19 +998,24 @@ public partial class Form1 : Form
         }
 
         Log($"Выбрана сеть: {network.AdapterName}, IP {network.Address}, маска {network.Mask}, шлюз {network.Gateway}.");
-        Log("Ищу свободный IP внутри реального диапазона этой сети.");
-        var candidate = FindFirstNotPinging(network);
+        var subnet = IpAddressPolicy.Subnet(network.Address, network.Mask!);
+        var pool = IpAddressPolicy.ParseDhcpPool(GetText(_dhcpStartBox), GetText(_dhcpEndBox), subnet);
+        Log(pool is null
+            ? "DHCP-пул роутера неизвестен. Найденный адрес будет только кандидатом: перед назначением согласуйте его с техником."
+            : "Ищу IP-кандидат вне указанного DHCP-пула роутера.");
+        Log(IpAddressPolicy.ReservationAdvice);
+        var candidate = FindCandidateAddress(network, pool);
         if (candidate is null)
         {
             SetStatus(_freeIpStatusLabel, "Не найден", StatusKind.Bad);
-            Log("Свободный IP не найден в выбранной сети. Проверь, что активен обычный LAN/Wi-Fi адаптер, а не VPN/виртуальная сеть.");
+            Log("В пределах 512 проверенных адресов IP-кандидат не найден. Проверьте DHCP-пул и выбранную сеть.");
             return;
         }
 
         InvokeIfNeeded(() => _ethernetIpBox.Text = candidate.ToString());
         FillEthernetFromCurrentNetwork();
-        SetStatus(_freeIpStatusLabel, "Найден", StatusKind.Good);
-        Log($"Свободный IP для принтера: {candidate}. Маска и шлюз показаны во втором шаге.");
+        SetStatus(_freeIpStatusLabel, "Кандидат", StatusKind.Warning);
+        Log($"IP-кандидат: {candidate}. Узел не ответил на ARP и ping; это не гарантирует, что адрес свободен. Маска и шлюз показаны во втором шаге.");
     }
 
     private void FillEthernetFromCurrentNetwork()
@@ -1225,16 +1278,19 @@ public partial class Form1 : Form
         }
     }
 
-    private static bool TryGetArpMac(IPAddress address, out string macAddress)
+    private static bool TryGetArpMac(IPAddress address, out string macAddress, IPAddress? sourceAddress = null)
     {
         macAddress = "";
         if (address.AddressFamily != AddressFamily.InterNetwork)
             return false;
 
-        var bytes = new byte[6];
-        var length = bytes.Length;
+        var bytes = new byte[8];
+        var length = 6;
         var destination = BitConverter.ToUInt32(address.GetAddressBytes(), 0);
-        var result = SendARP(destination, 0, bytes, ref length);
+        var source = sourceAddress is null ? 0 : BitConverter.ToUInt32(sourceAddress.GetAddressBytes(), 0);
+        var result = SendARP(destination, source, bytes, ref length);
+        if (sourceAddress is not null && result != 0 && result != 67)
+            throw new System.ComponentModel.Win32Exception(result, "Не удалось проверить адрес через ARP. Адрес не считается свободным.");
         if (result != 0 || length <= 0)
             return false;
 
@@ -1332,7 +1388,8 @@ public partial class Form1 : Form
     private NetworkInfo? GetPrimaryNetwork()
     {
         return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(x => x.OperationalStatus == OperationalStatus.Up && x.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+            .Where(x => x.OperationalStatus == OperationalStatus.Up &&
+                x.NetworkInterfaceType is not (NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel))
             .Select(adapter =>
             {
                 var props = adapter.GetIPProperties();
@@ -1340,66 +1397,41 @@ public partial class Form1 : Form
                 var gateway = props.GatewayAddresses.FirstOrDefault(x => x.Address.AddressFamily == AddressFamily.InterNetwork)?.Address;
                 return address is null ? null : new NetworkInfo(adapter.Name, address.Address, address.IPv4Mask, gateway);
             })
-            .Where(x => x is not null && x.Mask is not null)
-            .OrderByDescending(x => x!.Gateway is not null)
-            .ThenBy(x => IsVirtualAdapterName(x!.AdapterName))
+            .Where(x => x is not null && x.Mask is not null && !x.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal))
+            .OrderBy(x => IsVirtualAdapterName(x!.AdapterName))
+            .ThenByDescending(x => x!.Gateway is not null)
             .ThenByDescending(x => IsPrivateAddress(x!.Address))
             .ThenByDescending(x => x!.Mask?.ToString() == "255.255.255.0")
             .ThenByDescending(x => CountUsableAddresses(x!) > 10)
             .FirstOrDefault();
     }
 
-    private static IPAddress? FindFirstNotPinging(NetworkInfo network)
+    private static IPAddress? FindCandidateAddress(NetworkInfo network, IpRange? dhcpPool)
     {
-        var gateway = network.Gateway?.ToString();
-        var local = network.Address.ToString();
+        var excluded = NetworkInterface.GetAllNetworkInterfaces()
+            .SelectMany(adapter => adapter.GetIPProperties().UnicastAddresses)
+            .Select(address => address.Address.ToString()).ToHashSet(StringComparer.Ordinal);
+        if (network.Gateway is not null)
+            excluded.Add(network.Gateway.ToString());
+        foreach (var port in GetTcpIpPrinterPortRows())
+            excluded.Add(port.HostAddress);
 
-        foreach (var candidate in EnumerateCandidateAddresses(network).Take(512))
+        foreach (var candidate in IpAddressPolicy.Candidates(network.Address, network.Mask!, dhcpPool, excluded))
         {
-            var text = candidate.ToString();
-            if (text == gateway || text == local)
+            if (TryGetArpMac(candidate, out _, network.Address))
                 continue;
-
-            if (!TryGetArpMac(candidate, out _))
+            using var ping = new Ping();
+            var reply = ping.Send(candidate, 700);
+            if (reply.Status == IPStatus.Success || TryGetArpMac(candidate, out _, network.Address))
+                continue;
+            if (reply.Status is IPStatus.TimedOut or IPStatus.DestinationHostUnreachable)
                 return candidate;
+            throw new InvalidOperationException($"Проверка сети не выполнена ({reply.Status}). Адрес не считается свободным.");
         }
 
         return null;
     }
 
-    private static IEnumerable<IPAddress> EnumerateCandidateAddresses(NetworkInfo network)
-    {
-        if (network.Mask is null)
-            yield break;
-
-        var ip = ToUInt32(network.Address);
-        var mask = ToUInt32(network.Mask);
-        var networkAddress = ip & mask;
-        var broadcastAddress = networkAddress | ~mask;
-
-        if (broadcastAddress <= networkAddress + 1)
-            yield break;
-
-        var first = networkAddress + 1;
-        var last = broadcastAddress - 1;
-        var baseBytes = network.Address.GetAddressBytes();
-
-        foreach (var octet in Enumerable.Range(200, 55).Concat(Enumerable.Range(50, 150)))
-        {
-            var bytes = (byte[])baseBytes.Clone();
-            bytes[3] = (byte)octet;
-            var preferred = ToUInt32(new IPAddress(bytes));
-            if (preferred >= first && preferred <= last)
-                yield return FromUInt32(preferred);
-        }
-
-        for (var value = first; value <= last; value++)
-        {
-            yield return FromUInt32(value);
-            if (value == uint.MaxValue)
-                yield break;
-        }
-    }
 
     private static uint CountUsableAddresses(NetworkInfo network)
     {
@@ -1415,7 +1447,7 @@ public partial class Form1 : Form
 
     private static bool IsVirtualAdapterName(string name)
     {
-        var markers = new[] { "virtual", "vethernet", "hyper-v", "vmware", "virtualbox", "docker", "wsl", "vpn", "tap", "loopback" };
+        var markers = new[] { "virtual", "vethernet", "hyper-v", "vmware", "virtualbox", "docker", "wsl", "vpn", "tap", "tun", "happ", "wireguard", "tailscale", "loopback" };
         return markers.Any(marker => name.Contains(marker, StringComparison.OrdinalIgnoreCase));
     }
 
@@ -1487,14 +1519,16 @@ public partial class Form1 : Form
 
     private void DownloadOrRunUtility()
     {
-        var model = _models[GetSelectedModel()];
+        Log(IpAddressPolicy.ReservationAdvice);
+        var settings = CaptureUtilitySettings();
+        var model = _models[settings.Model];
         try
         {
             if (model.Name.Equals("ATOL DD340", StringComparison.OrdinalIgnoreCase))
             {
                 var utilityPath = Dd340UtilityService.GetOrDownload(Log);
                 Log("Утилита ATOL DD340 готова. Открываю и подготавливаю настройки.");
-                OpenAndPrepareHprtUtility(utilityPath);
+                OpenAndPrepareHprtUtility(utilityPath, settings);
                 return;
             }
 
@@ -1517,339 +1551,70 @@ public partial class Form1 : Form
         }
     }
 
-    private void OpenAndPrepareHprtUtility(string utilityPath)
+    internal sealed record UtilitySettings(string Model, string Ip, string Mask, string Gateway, string DhcpStart, string DhcpEnd);
+
+    internal UtilitySettings CaptureUtilitySettings()
     {
-        var ip = GetText(_ethernetIpBox);
-        var mask = GetText(_ethernetMaskBox);
-        var gateway = GetText(_ethernetGatewayBox);
+        UtilitySettings? settings = null;
+        InvokeIfNeeded(() => settings = new UtilitySettings(GetSelectedModel(),
+            _ethernetIpBox.Text.Trim(), _ethernetMaskBox.Text.Trim(), _ethernetGatewayBox.Text.Trim(),
+            _dhcpStartBox.Text.Trim(), _dhcpEndBox.Text.Trim()));
+        if (settings is null) throw new InvalidOperationException("Окно настройки закрыто.");
+        if (TryParseIpv4(settings.Ip, out var address) && GetPrimaryNetwork() is { Mask: not null } network)
+        {
+            var subnet = IpAddressPolicy.Subnet(network.Address, network.Mask);
+            var pool = IpAddressPolicy.ParseDhcpPool(settings.DhcpStart, settings.DhcpEnd, subnet);
+            if (!subnet.Contains(address))
+                throw new InvalidOperationException("IP принтера находится вне выбранной сети компьютера.");
+            if (pool?.Contains(address) == true)
+                throw new InvalidOperationException("Этот статический IP входит в DHCP-пул. Выберите адрес вне пула или согласуйте исключение с техником.");
+        }
+        return settings;
+    }
+
+    private void OpenAndPrepareHprtUtility(string utilityPath, UtilitySettings settings)
+    {
         var usbDevices = GetUsbDeviceRows();
-        var printerConnectedByUsb = usbDevices.Any(IsLikelyUsbDeviceForSelectedModel) ||
+        var printerConnectedByUsb = usbDevices.Any(device =>
+            IsLikelyDriverForModel($"{device.Name} {device.Manufacturer} {device.PnpDeviceId}", settings.Model)) ||
             usbDevices.Any(IsGenericUsbPrinterDevice);
 
         HprtUtilityAutomation.OpenAndPrepare(
             utilityPath,
-            ip,
-            mask,
-            gateway,
+            settings.Ip,
+            settings.Mask,
+            settings.Gateway,
             printerConnectedByUsb,
             Log);
     }
 
     private void DownloadDriver()
     {
-        var model = _models[GetSelectedModel()];
-        if (string.IsNullOrWhiteSpace(model.DriverGoogleDriveFileId) ||
-            string.IsNullOrWhiteSpace(model.DriverFileName))
+        var model = GetSelectedModel() switch
         {
-            Log("Для этой модели автоматическое скачивание драйвера пока не настроено.");
+            "ATOL DD340" => "dd340",
+            "ATOL BP41" => "bp41",
+            _ => null
+        };
+        if (model is null)
+        {
+            Log("Для выбранной модели автоматическая установка пока не настроена.");
             OpenDriverPage();
             return;
         }
 
-        var targetDirectory = GetLabelPrinterDirectory();
-        var destination = Path.Combine(targetDirectory, model.DriverFileName);
-        var extractDirectory = Path.Combine(targetDirectory, Path.GetFileNameWithoutExtension(model.DriverFileName));
-
-        try
+        var driver = DriverInstallation.DriverName(model);
+        if (GetPrinterDriverNames().Contains(driver, StringComparer.OrdinalIgnoreCase))
         {
-            if (!Directory.Exists(extractDirectory) ||
-                !Directory.EnumerateFiles(extractDirectory, "*", SearchOption.AllDirectories).Any())
-            {
-                Log("Скачиваю драйвер для " + model.Name + "...");
-                Log("Папка сохранения: " + targetDirectory);
-                DownloadGoogleDriveFile(model.DriverGoogleDriveFileId, destination);
-                Directory.CreateDirectory(extractDirectory);
-                Log("Распаковываю драйвер...");
-                ZipFile.ExtractToDirectory(destination, extractDirectory, true);
-                File.Delete(destination);
-            }
-            else
-            {
-                Log("Файлы драйвера уже скачаны.");
-            }
-
-            InstallSelectedDriverSilently(extractDirectory);
-        }
-        catch (Exception ex)
-        {
-            Log("Не удалось скачать или установить драйвер: " + ex.Message);
-        }
-    }
-
-    private static string GetLabelPrinterDirectory()
-    {
-        var documents = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        var directory = Path.Combine(documents, "Label_printer");
-        Directory.CreateDirectory(directory);
-        return directory;
-    }
-
-    private static string? FindFile(string directory, string fileName)
-    {
-        if (!Directory.Exists(directory))
-            return null;
-
-        return Directory
-            .EnumerateFiles(directory, fileName, SearchOption.AllDirectories)
-            .FirstOrDefault();
-    }
-
-    private static void RunFile(string filePath)
-    {
-        Process.Start(new ProcessStartInfo(filePath)
-        {
-            UseShellExecute = true,
-            WorkingDirectory = Path.GetDirectoryName(filePath) ?? Environment.CurrentDirectory
-        });
-    }
-
-    private void InstallSelectedDriverSilently(string packageDirectory)
-    {
-        if (IsAtolDd340Selected())
-        {
-            InstallDd340DriverSilently(packageDirectory);
+            Log("Драйвер уже установлен: " + driver);
             return;
         }
-
-        if (IsAtolBp41Selected())
-        {
-            InstallBp41DriverSilently(packageDirectory);
-            return;
-        }
-
-        Log("Тихая установка для выбранной модели пока не настроена.");
-    }
-
-    private void InstallDd340DriverSilently(string packageDirectory)
-    {
-
-        const string driverName = "HPRT HD200 - ZPL";
-        if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
-        {
-            Log("Драйвер HPRT HD200 - ZPL уже установлен.");
-            RefreshPrinters();
-            return;
-        }
-
-        if (!IsRunningAsAdministrator())
-        {
-            Log("Для тихой установки драйвера запусти программу от имени администратора.");
-            return;
-        }
-
-        var driverWizard = PrepareDriverWizard(packageDirectory);
-        if (string.IsNullOrWhiteSpace(driverWizard))
-        {
-            Log("Не удалось подготовить DriverWizard.exe для тихой установки.");
-            return;
-        }
-
-        var temporaryPrinterName = "ThermoPrinterTool Driver Setup " + Environment.ProcessId;
-        var driverInstalled = false;
-        try
-        {
-            Log("Устанавливаю драйвер HPRT HD200 - ZPL...");
-            var arguments = $"install /name:\"{temporaryPrinterName}\" /model:\"{driverName}\" /port:\"LPT1:\"";
-            var exitCode = RunProcess(driverWizard, arguments, Path.GetDirectoryName(driverWizard));
-            if (exitCode != 0)
-            {
-                Log($"Не удалось тихо установить драйвер. Код DriverWizard: {exitCode}.");
-                return;
-            }
-
-            for (var attempt = 0; attempt < 5; attempt++)
-            {
-                if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    driverInstalled = true;
-                    break;
-                }
-
-                Thread.Sleep(500);
-            }
-        }
-        finally
-        {
-            RemoveTemporaryPrinter(temporaryPrinterName);
-        }
-
-        if (driverInstalled)
-        {
-            Log("Драйвер HPRT HD200 - ZPL установлен.");
-            RefreshPrinters();
-        }
-        else
-        {
-            Log("DriverWizard завершился без ошибки, но драйвер HPRT HD200 - ZPL не найден в Windows.");
-        }
-    }
-
-    private void InstallBp41DriverSilently(string packageDirectory)
-    {
-        const string driverName = "Rongta RP4xx Series";
-        if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
-        {
-            Log("Драйвер Rongta RP4xx Series уже установлен.");
-            RefreshPrinters();
-            return;
-        }
-
-        if (!IsRunningAsAdministrator())
-        {
-            Log("Для тихой установки драйвера запусти программу от имени администратора.");
-            return;
-        }
-
-        var installer = FindFile(packageDirectory, "PrnInst.exe");
-        var infPath = FindFile(packageDirectory, "RONGTAOEM.inf");
-        if (string.IsNullOrWhiteSpace(installer) || string.IsNullOrWhiteSpace(infPath))
-        {
-            Log("В пакете ATOL BP41 не найдены PrnInst.exe или RONGTAOEM.inf.");
-            return;
-        }
-
-        var temporaryPrinterName = "ThermoPrinterTool BP41 Driver Setup " + Environment.ProcessId;
-        var driverInstalled = false;
-        try
-        {
-            Log("Устанавливаю драйвер Rongta RP4xx Series без открытия мастера...");
-            var driverDirectory = Path.GetDirectoryName(infPath)!;
-            var arguments = $"\"/DIR={driverDirectory}\" /NOLICENCE \"/INSTPRN={driverName}#LPT1:#{temporaryPrinterName}\"";
-            var exitCode = RunProcess(installer, arguments, Path.GetDirectoryName(installer));
-            if (exitCode != 0)
-            {
-                Log($"Не удалось тихо установить драйвер. Код PrnInst: {exitCode}.");
-                return;
-            }
-
-            for (var attempt = 0; attempt < 10; attempt++)
-            {
-                if (GetPrinterDriverNames().Any(x => x.Equals(driverName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    driverInstalled = true;
-                    break;
-                }
-
-                Thread.Sleep(500);
-            }
-        }
-        finally
-        {
-            RemoveTemporaryPrinter(temporaryPrinterName);
-        }
-
-        if (driverInstalled)
-        {
-            Log("Драйвер Rongta RP4xx Series установлен.");
-            RefreshPrinters();
-        }
-        else
-        {
-            Log("PrnInst завершился без ошибки, но драйвер Rongta RP4xx Series не найден в Windows.");
-        }
-    }
-
-    private string? PrepareDriverWizard(string packageDirectory)
-    {
-        var driverWizard = FindDriverWizard(packageDirectory) ?? FindInstalledSeagullDriverWizard();
-        if (!string.IsNullOrWhiteSpace(driverWizard))
-            return driverWizard;
-
-        var packageInstaller = Directory
-            .EnumerateFiles(packageDirectory, "*.exe", SearchOption.AllDirectories)
-            .Where(path => !Path.GetFileName(path).Equals("DriverWizard.exe", StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(path => Path.GetFileName(path).Contains("HPRT", StringComparison.OrdinalIgnoreCase))
-            .FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(packageInstaller))
-            return null;
-
-        var extractedDirectory = Path.Combine(packageDirectory, "Seagull");
-        if (!TryExtractSeagullPackage(packageInstaller, extractedDirectory))
-            return null;
-
-        return FindDriverWizard(extractedDirectory) ?? FindInstalledSeagullDriverWizard();
-    }
-
-    private static string? FindDriverWizard(string directory)
-    {
-        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
-            return null;
-
-        return Directory
-            .EnumerateFiles(directory, "DriverWizard.exe", SearchOption.AllDirectories)
-            .FirstOrDefault();
-    }
-
-    private static string? FindInstalledSeagullDriverWizard()
-    {
-        var candidates = new[]
-        {
-            @"C:\Seagull\HPRT\2024.3 M-0",
-            @"C:\Seagull\HPRT",
-            @"C:\Seagull"
-        };
-
-        return candidates
-            .Select(FindDriverWizard)
-            .FirstOrDefault(path => !string.IsNullOrWhiteSpace(path));
-    }
-
-    private bool TryExtractSeagullPackage(string packageInstallerPath, string extractedDirectory)
-    {
-        try
-        {
-            Directory.CreateDirectory(extractedDirectory);
-            var exitCode = RunProcess(packageInstallerPath, $"/x \"{extractedDirectory}\"", Path.GetDirectoryName(packageInstallerPath));
-            Log(exitCode == 0
-                ? "Пакет драйвера распакован для тихой установки."
-                : $"Не удалось тихо распаковать пакет драйвера, код {exitCode}.");
-            return exitCode == 0;
-        }
-        catch (Exception ex)
-        {
-            Log("Не удалось подготовить тихую установку: " + ex.Message);
-            return false;
-        }
-    }
-
-    private static bool IsRunningAsAdministrator()
-    {
-        using var identity = WindowsIdentity.GetCurrent();
-        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
-    }
-
-    private static void RemoveTemporaryPrinter(string printerName)
-    {
-        RunPowerShell("Remove-Printer -Name '" + EscapePowerShell(printerName) + "' -ErrorAction SilentlyContinue");
-    }
-
-    private static void DownloadGoogleDriveFile(string fileId, string destination)
-    {
-        using var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true });
-        client.Timeout = TimeSpan.FromMinutes(10);
-
-        var url = "https://drive.usercontent.google.com/download?id=" +
-            Uri.EscapeDataString(fileId) +
-            "&export=download&confirm=t";
-
-        using var response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
-        response.EnsureSuccessStatusCode();
-
-        var contentType = response.Content.Headers.ContentType?.MediaType ?? "";
-        if (contentType.Contains("text/html", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Google Drive не отдал файл напрямую.");
-
-        var tempFile = destination + ".download";
-        using (var input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
-        using (var output = File.Create(tempFile))
-        {
-            input.CopyTo(output);
-        }
-
-        if (new FileInfo(tempFile).Length == 0)
-            throw new InvalidOperationException("Скачанный файл пустой.");
-
-        File.Move(tempFile, destination, true);
+        Log("Windows запросит права только на установку драйвера. Архив будет проверен по SHA-256.");
+        ElevatedTasks.Run("--install-driver", model);
+        if (!GetPrinterDriverNames().Contains(driver, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Установщик завершился, но драйвер не найден в Windows.");
+        Log("Драйвер установлен: " + driver);
+        RefreshPrinters();
     }
 
     private static void DownloadFile(string url, string destination)
@@ -1895,59 +1660,24 @@ public partial class Form1 : Form
 
     private void CreateTcpIpPort()
     {
-        var portName = CreateTcpIpPortOnly();
-        if (string.IsNullOrWhiteSpace(portName))
-            return;
-
-        CreateWindowsPrinterFromSelectedDriver(portName);
-        RefreshPrinters();
-    }
-
-    private string? CreateTcpIpPortOnly()
-    {
         var ip = GetPrinterIp();
+        var driver = FindBestDriverName();
+        var role = GetSelectedRole();
         if (ip is null)
-            return null;
-
-        var portName = "IP_" + ip;
-        var script = $"Add-PrinterPort -Name '{EscapePowerShell(portName)}' -PrinterHostAddress '{EscapePowerShell(ip)}'";
-        var output = RunPowerShell(script);
-        Log(string.IsNullOrWhiteSpace(output)
-            ? $"TCP/IP порт Windows создан или уже существует: {portName} -> {ip}"
-            : output.Trim());
-
-        return portName;
-    }
-
-    private void CreateWindowsPrinterFromSelectedDriver(string portName)
-    {
-        var roleName = GetSelectedRole();
-        var driverName = FindBestDriverName();
-
-        if (string.IsNullOrWhiteSpace(driverName))
-        {
-            Log(IsAtolDd340Selected()
-                ? "Драйвер HPRT HD200 - ZPL не установлен. Сначала нажми 'Скачать и установить драйвер'."
-                : "Не удалось создать принтер Windows: установи драйвер выбранной модели и повтори создание порта.");
             return;
+        if (string.IsNullOrWhiteSpace(driver))
+            throw new InvalidOperationException("Сначала установите драйвер выбранной модели.");
+        try
+        {
+            ElevatedTasks.ConfigurePrinter(driver, role, ip);
         }
-
-        var script = "$printer = Get-Printer -Name '" + EscapePowerShell(roleName) + "' -ErrorAction SilentlyContinue; " +
-            "$printerOnPort = Get-Printer | Where-Object { $_.PortName -eq '" + EscapePowerShell(portName) + "' } | Select-Object -First 1; " +
-            "if ($null -eq $printer) { " +
-            "if ($null -ne $printerOnPort) { " +
-            "Rename-Printer -Name $printerOnPort.Name -NewName '" + EscapePowerShell(roleName) + "'; " +
-            "Set-Printer -Name '" + EscapePowerShell(roleName) + "' -DriverName '" + EscapePowerShell(driverName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
-            "} else { " +
-            "Add-Printer -Name '" + EscapePowerShell(roleName) + "' -DriverName '" + EscapePowerShell(driverName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
-            "} " +
-            "} else { " +
-            "Set-Printer -Name '" + EscapePowerShell(roleName) + "' -DriverName '" + EscapePowerShell(driverName) + "' -PortName '" + EscapePowerShell(portName) + "' " +
-            "}";
-        var output = RunPowerShell(script);
-        Log(string.IsNullOrWhiteSpace(output)
-            ? $"Принтер Windows готов: {roleName}, драйвер {driverName}, порт {portName}."
-            : output.Trim());
+        catch (UnauthorizedAccessException) when (!ElevatedTasks.IsAdministrator)
+        {
+            Log("Windows требует права для изменения очереди печати. Подтвердите отдельный запрос UAC.");
+            ElevatedTasks.Run("--configure-printer", driver, role, ip);
+        }
+        Log($"Принтер Windows готов: {role}, драйвер {driver}, порт IP_{ip}.");
+        RefreshPrinters();
     }
 
     private void PrintTestPage()
@@ -2016,11 +1746,13 @@ public partial class Form1 : Form
     }
 
     private bool IsLikelyDriverForSelectedModel(string value)
+        => IsLikelyDriverForModel(value, GetSelectedModel());
+
+    private static bool IsLikelyDriverForModel(string value, string model)
     {
         if (string.IsNullOrWhiteSpace(value))
             return false;
 
-        var model = GetSelectedModel();
         var keywords = model switch
         {
             "ATOL DD340" => new[] { "DD340", "HD200" },
@@ -2255,6 +1987,7 @@ public partial class Form1 : Form
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8
         };
+        startInfo.Environment.Remove("PSModulePath");
 
         using var process = Process.Start(startInfo);
         if (process is null)
@@ -2285,21 +2018,6 @@ public partial class Form1 : Form
         return string.IsNullOrWhiteSpace(error) ? output : output + Environment.NewLine + error;
     }
 
-    private static int RunProcess(string fileName, string arguments, string? workingDirectory)
-    {
-        using var process = Process.Start(new ProcessStartInfo(fileName, arguments)
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = workingDirectory ?? Environment.CurrentDirectory
-        });
-
-        if (process is null)
-            return -1;
-
-        process.WaitForExit();
-        return process.ExitCode;
-    }
 
     private static string RemovePowerShellXmlNoise(string text)
     {

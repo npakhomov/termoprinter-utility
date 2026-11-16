@@ -213,6 +213,7 @@ internal sealed class DiagnosticForm : Form
             Log($"Повторная настройка {detectedModel}. Использую прежний IP: {resolvedAddress}, " +
                 $"маска: {localNetwork.MaskText}, шлюз: {localNetwork.Gateway}.");
             Log("Подключите настраиваемый принтер к компьютеру по USB.");
+            Log(IpAddressPolicy.ReservationAdvice, Color.FromArgb(143, 92, 0));
 
             if (isDd340)
             {
